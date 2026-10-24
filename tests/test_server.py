@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from http.cookiejar import CookieJar
+from urllib.request import build_opener, HTTPCookieProcessor
 import server
 
 class AppTest(unittest.TestCase):
@@ -15,6 +17,10 @@ class AppTest(unittest.TestCase):
         cls.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         cls.base = 'http://127.0.0.1:' + str(cls.http.server_port)
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
+        cls.client = build_opener(HTTPCookieProcessor(CookieJar()))
+        setup = Request(cls.base + '/api/setup', json.dumps({'name':'Admin','username':'admin','password':'test-password-123'}).encode(), {'Content-Type':'application/json'})
+        with cls.client.open(setup) as response:
+            assert response.status == 200
     @classmethod
     def tearDownClass(cls):
         cls.http.shutdown()
@@ -24,7 +30,7 @@ class AppTest(unittest.TestCase):
         headers = {'Content-Type': 'application/json'}
         if origin: headers['Origin'] = origin
         req = Request(self.base + '/api/' + kind, json.dumps(data).encode(), headers)
-        with urlopen(req) as response: return json.load(response)
+        with self.client.open(req) as response: return json.load(response)
     def test_persistence_and_update(self):
         p = self.post('products', {'name': 'Câmera', 'price': 120})
         p['price'] = 150

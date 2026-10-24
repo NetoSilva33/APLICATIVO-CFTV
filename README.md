@@ -1,49 +1,39 @@
 # Segura Gestão — Segurança eletrônica
 
-Aplicativo local em português para equipamentos, clientes, orçamentos, manutenções e calculadoras.
+Aplicativo web responsivo e instalável como PWA, pensado para operação de empresas de segurança eletrônica em computador e celular. O servidor atual usa SQLite local e a biblioteca padrão do Python; não precisa de pacotes externos.
 
 ## Executar
 
-Instale Python 3.10 ou superior e execute nesta pasta:
+Instale Python 3.10 ou superior e, nesta pasta, execute:
 
 ```bash
-python server.py
+python3 server.py
 ```
 
-No Windows, use `py server.py` ou abra `iniciar.bat`. Acesse http://127.0.0.1:8000 e mantenha o terminal aberto. Não requer pacotes adicionais.
+Abra http://127.0.0.1:8000. No Windows, execute `py -3 server.py` ou abra `iniciar.bat`. Na primeira abertura, crie o acesso de administrador com uma senha de pelo menos 12 caracteres. O administrador cadastra os outros acessos na área **Acessos**.
 
-## Primeiro uso
+O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução serve ao próprio computador. Para acessar de outros aparelhos, hospede a aplicação atrás de HTTPS e configure o proxy antes de disponibilizar o endereço à equipe. Crie o administrador antes de expor uma instalação nova. Não exponha o servidor diretamente à internet.
 
-1. Preencha Minha empresa e envie uma logo PNG/JPEG (até 1 MB).
-2. Cadastre clientes e equipamentos/serviços, com marca, unidade e preço.
-3. Monte um orçamento selecionando itens e quantidades. Preencha validade, pagamento, garantia, frete, desconto e observações.
-4. Salve e abra a proposta. Clique em **Salvar em PDF / imprimir** e escolha **Salvar como PDF** na janela do navegador. Desative cabeçalhos/rodapés do navegador.
-5. Agende manutenções e acompanhe dias restantes e atrasos. Após concluir, clique em Reagendar para gerar a próxima visita.
+## Áreas incluídas
 
-As propostas guardam uma cópia dos preços e dados de cliente/empresa na emissão. Alterar cadastros não altera propostas antigas.
+- **Ordens de serviço:** abertura por cliente e equipamento, registro do serviço e materiais utilizados, situação do atendimento, assinatura desenhada com mouse ou tela sensível ao toque e impressão do documento em PDF pelo navegador.
+- **Clientes e equipamentos:** cadastro de clientes e equipamentos vinculados, fabricante, modelo, número de série ou local.
+- **Manutenção:** registro de visita, histórico por equipamento e datas da última e próxima manutenção, com alertas de vencimento.
+- **Almoxarifado:** técnicos enviam pedidos; almoxarifado e supervisão atualizam o andamento.
+- **Manuais técnicos:** catálogo de documentos e referências fornecidos pela empresa, com links para os arquivos ou páginas oficiais.
+- **Acessos:** criação de contas para administrador, supervisor, técnico e almoxarifado. As senhas são armazenadas com derivação PBKDF2 e a sessão usa cookie HttpOnly.
 
-## Dados e limites
+Para salvar uma ordem em PDF, abra a ordem e escolha **Salvar ordem em PDF**. Na janela do navegador, selecione **Salvar como PDF**. A assinatura fica armazenada como imagem no banco SQLite junto com a ordem.
 
-SQLite persistente em `data/gestao.db`, criado automaticamente. Para backup, feche o servidor e copie a pasta `data`. Para restaurar, recoloque a pasta no projeto com o servidor fechado. Não envie o banco ao GitHub.
+## Dados e preparo para uso real
 
-Esta versão funciona apenas no computador local (127.0.0.1), sem login, múltiplas empresas, sincronização, notificações automáticas ou aplicativo móvel nativo. Não exponha o servidor à internet sem autenticação e infraestrutura adequada. Os prazos são atualizados ao abrir a aba.
+O banco persistente fica em `data/gestao.db` e é criado automaticamente. `CFTV_DB` permite escolher outro caminho. Para backup, feche o servidor e copie a pasta `data`; não envie o banco ao GitHub. Os dados que já estavam no banco permanecem armazenados.
 
-## Calculadoras
+Esta entrega é uma base inicial: não inclui envio de PDF por e-mail/WhatsApp, redefinição de senha, armazenamento de arquivo de manual dentro do app, assinatura digital certificada, sincronização em nuvem ou implantação pública. O modo local ainda não dá acesso pelo celular usando outra rede. Antes de usar com dados de clientes em produção, faça implantação com HTTPS, controle de backup e política de acesso adequada.
 
-- Armazenamento CFTV: TB decimal = câmeras × Mbps × dias × horas/dia × 3600 ÷ 8 ÷ 1.000.000; mostra também reserva de 20%.
-- Fonte: A = quantidade × corrente unitária × (1 + reserva/100); W = V × A.
-- Motor monofásico CA: I = potência mecânica / (V × rendimento × fator de potência).
-- Motor trifásico CA: mesma fórmula com √3 no denominador e tensão entre fases.
-- Motor CC: I = potência mecânica / (V × rendimento).
-- Conversão: 1 cv = 735,49875 W; 1 hp mecânico = 745,699872 W.
-
-São estimativas. Confira bitrate real e dados de placa. Não dimensiona partida, capacitor, cabos, proteção ou motor por peso do portão.
-
-## Testar
+## Verificações
 
 ```bash
-python -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 node --check static/app.js
 ```
-
-Node é opcional, usado somente na verificação de sintaxe JavaScript.

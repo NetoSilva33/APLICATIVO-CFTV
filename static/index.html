@@ -1,3 +1,27 @@
 <!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Segura Gestão | Segurança eletrônica</title><link rel="stylesheet" href="style.css"></head>
-<body><aside><div class="brand"><span class="mark">S</span><div>SEGURA<span class="brand-sub">GESTÃO TÉCNICA</span></div></div><div class="nav-label">ESPAÇO DE TRABALHO</div><nav id="nav"></nav><div class="sidebar-foot">Segurança eletrônica<br><small>Organização para quem protege.</small></div></aside><main><header><span>PAINEL DA EMPRESA</span><span id="today"></span></header><div id="app"></div></main><div role="status" id="toast"></div><script src="app.js"></script></body></html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#102c34">
+  <meta name="description" content="Gestão de serviços e manutenção em segurança eletrônica.">
+  <title>Segura Gestão | Segurança eletrônica</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside id="sidebar">
+    <a class="brand" href="#inicio" aria-label="Segura Gestão, início"><span class="mark">S</span><span>SEGURA<small>GESTÃO TÉCNICA</small></span></a>
+    <div class="nav-label">ESPAÇO DE TRABALHO</div>
+    <nav id="nav" aria-label="Menu principal"></nav>
+    <div class="sidebar-foot">Segurança eletrônica<br><small>Organização para quem protege.</small></div>
+  </aside>
+  <main>
+    <header id="topbar"><span>PAINEL DA EMPRESA</span><div class="user-area"><span id="today"></span><span id="current-user"></span><button id="logout" class="secondary small">Sair</button></div></header>
+    <div id="app" aria-live="polite"><div class="loading">Carregando Segura Gestão…</div></div>
+  </main>
+  <div role="status" id="toast" aria-live="assertive"></div>
+  <script src="app.js" defer></script>
+</body>
+</html>
