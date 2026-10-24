@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("CFTV_DB", str(ROOT / "data" / "gestao.db")))
 COOKIE = "segura_session"
 PLATFORM_COOKIE = "segura_platform_session"
+CLIENT_COOKIE = "segura_client_session"
 ROLES = {"admin", "supervisor", "technician", "warehouse"}
 KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "inventoryItems", "manuals", "products", "quotes", "company"}
 SESSION_HOURS = 12
@@ -69,6 +70,14 @@ def add_billing_period(start, period):
     return start.replace(year=year, month=month, day=day)
 
 
+def add_months(start, months):
+    month_index = start.month - 1 + int(months)
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return start.replace(year=year, month=month, day=day)
+
+
 def expiration_countdown(value, now=None):
     if not value:
         return None, False
@@ -106,6 +115,13 @@ def initialize_schema(db):
             id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT,
             actor_name TEXT NOT NULL, action TEXT NOT NULL, kind TEXT NOT NULL,
             record_id TEXT, summary TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS client_portal_tokens (
+            organization_id TEXT NOT NULL, client_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+            PRIMARY KEY(organization_id,client_id))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS client_portal_sessions (
+            token_hash TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+            client_id TEXT NOT NULL, expires TEXT NOT NULL)""")
         db.execute("CREATE INDEX IF NOT EXISTS idx_records_org_kind ON records(organization_id,kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(organization_id,role,active)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_audit_org_time ON audit_logs(organization_id,created_at)")
@@ -152,6 +168,13 @@ def initialize_schema(db):
         id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT,
         actor_name TEXT NOT NULL, action TEXT NOT NULL, kind TEXT NOT NULL,
         record_id TEXT, summary TEXT NOT NULL, created_at TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE client_portal_tokens (
+        organization_id TEXT NOT NULL, client_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+        PRIMARY KEY(organization_id,client_id))""")
+    db.execute("""CREATE TABLE client_portal_sessions (
+        token_hash TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+        client_id TEXT NOT NULL, expires TEXT NOT NULL)""")
 
     if old_users:
         profile = {}
@@ -309,6 +332,32 @@ class Handler(SimpleHTTPRequestHandler):
                 WHERE s.token_hash=? AND s.expires>? AND u.active=1""", (digest,now)).fetchone()
         return dict(row) if row else None
 
+    def current_client_portal(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            raw = cookie[CLIENT_COOKIE].value
+        except Exception:
+            return None
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        with connect() as db:
+            row = db.execute("""SELECT s.organization_id,s.client_id FROM client_portal_sessions s
+                JOIN organizations o ON o.id=s.organization_id
+                JOIN client_portal_tokens t ON t.organization_id=s.organization_id AND t.client_id=s.client_id
+                WHERE s.token_hash=? AND s.expires>? AND o.status IN ('active','trial')
+                  AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)
+                  AND (o.status!='active' OR o.subscription_ends_at IS NULL OR o.subscription_ends_at>?)""",
+                (digest, now, now, now)).fetchone()
+        return dict(row) if row else None
+
+    def require_client_portal(self):
+        client_session = self.current_client_portal()
+        if not client_session:
+            self.json_response(401, {"error": "Acesse pelo link de cliente fornecido pela empresa."})
+            return None
+        return client_session
+
     def require_platform_user(self):
         user = self.current_platform_user()
         if not user:
@@ -318,6 +367,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path in {"/cliente", "/cliente/"}:
+            self.path = "/client.html"
+            return super().do_GET()
         if path in {"/plataforma", "/plataforma/", "/platform"}:
             self.path = "/platform.html"
             return super().do_GET()
@@ -329,6 +381,29 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as db:
                 has_platform_users = db.execute("SELECT EXISTS(SELECT 1 FROM platform_users)").fetchone()[0]
             return self.json_response(200, {"setupRequired": not bool(has_platform_users), "user": self.current_platform_user()})
+        if path == "/api/client-portal/data":
+            portal = self.require_client_portal()
+            if not portal:
+                return
+            with connect() as db:
+                client_row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='clients' AND id=?",
+                                         (portal["organization_id"], portal["client_id"])).fetchone()
+                if not client_row:
+                    return self.json_response(404, {"error": "O cadastro deste cliente não está mais disponível."})
+                records = {kind: [] for kind in ("orders", "assets", "maintenance")}
+                public_fields = {
+                    "orders": ("id","number","title","scheduled","scheduled_time","duration_minutes","technician","status","summary","work","materials","signature_name","signature","signature_at","checklist","photos","created_at"),
+                    "assets": ("id","name","brand","model","serial","last_service","next_service"),
+                    "maintenance": ("id","equipment","performed","due","notes"),
+                }
+                for kind in records:
+                    rows = db.execute("SELECT data FROM records WHERE organization_id=? AND kind=?",
+                                      (portal["organization_id"], kind)).fetchall()
+                    records[kind] = [{key: record[key] for key in public_fields[kind] if key in record}
+                                     for row in rows if (record := json.loads(row[0])).get("client_id") == portal["client_id"]]
+                organization = db.execute("SELECT name FROM organizations WHERE id=?", (portal["organization_id"],)).fetchone()
+            client_record=json.loads(client_row[0])
+            return self.json_response(200, {"client": {"id":portal["client_id"],"name":client_record.get("name","Cliente"),"contact":client_record.get("contact","")}, "organization": organization["name"], **records})
         if path == "/api/platform/companies":
             user = self.require_platform_user()
             if not user:
@@ -349,6 +424,7 @@ class Handler(SimpleHTTPRequestHandler):
             user = self.require_user()
             if not user:
                 return
+            self.generate_preventive_orders(user)
             with connect() as db:
                 records = {key: [] for key in KINDS}
                 for kind, data in db.execute("SELECT kind,data FROM records WHERE organization_id=? ORDER BY rowid", (user["organization_id"],)):
@@ -522,10 +598,55 @@ class Handler(SimpleHTTPRequestHandler):
                 db.execute("DELETE FROM platform_sessions WHERE token_hash=?",(hashlib.sha256(token.encode()).hexdigest(),))
             return self.json_response(200,{"ok":True},(("Set-Cookie",f"{PLATFORM_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),))
 
+        if path == "/api/client-portal/session":
+            token = str(data.get("token", ""))
+            if not 32 <= len(token) <= 128:
+                return self.json_response(401, {"error": "O link de acesso do cliente é inválido ou expirou."})
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            with connect() as db:
+                row = db.execute("SELECT organization_id,client_id FROM client_portal_tokens WHERE token_hash=?", (digest,)).fetchone()
+                if not row:
+                    return self.json_response(401, {"error": "O link de acesso do cliente é inválido ou foi substituído."})
+                session_token = secrets.token_urlsafe(32)
+                expires = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+                db.execute("INSERT INTO client_portal_sessions VALUES (?,?,?,?)",
+                           (hashlib.sha256(session_token.encode()).hexdigest(), row["organization_id"], row["client_id"], expires))
+            secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+            cookie = f"{CLIENT_COOKIE}={session_token}; HttpOnly; SameSite=Strict; Path=/api/client-portal; Max-Age=28800{secure}"
+            return self.json_response(200, {"ok": True}, (("Set-Cookie", cookie),))
+
+        if path == "/api/client-portal/logout":
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            raw = cookie[CLIENT_COOKIE].value if CLIENT_COOKIE in cookie else ""
+            if raw:
+                with connect() as db:
+                    db.execute("DELETE FROM client_portal_sessions WHERE token_hash=?", (hashlib.sha256(raw.encode()).hexdigest(),))
+            return self.json_response(200, {"ok": True}, (("Set-Cookie", f"{CLIENT_COOKIE}=; HttpOnly; SameSite=Strict; Path=/api/client-portal; Max-Age=0"),))
+
         platform_routes={"/api/platform/companies","/api/platform/companies/update"}
         user = self.require_platform_user() if path in platform_routes else self.require_user()
         if not user:
             return
+        if path == "/api/client-portal/create-link":
+            if user["role"] not in {"admin", "supervisor"}:
+                return self.json_response(403, {"error": "Somente a administração ou supervisão pode criar links de cliente."})
+            client_id = str(data.get("client_id", ""))
+            token = secrets.token_urlsafe(32)
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            now = datetime.now(timezone.utc).isoformat()
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                exists = db.execute("SELECT 1 FROM records WHERE organization_id=? AND kind='clients' AND id=?",
+                                    (user["organization_id"], client_id)).fetchone()
+                if not exists:
+                    return self.json_response(404, {"error": "Cliente não encontrado nesta empresa."})
+                db.execute("DELETE FROM client_portal_sessions WHERE organization_id=? AND client_id=?",
+                           (user["organization_id"], client_id))
+                db.execute("INSERT OR REPLACE INTO client_portal_tokens VALUES (?,?,?,?)",
+                           (user["organization_id"], client_id, digest, now))
+                self.log_audit(db, user, "create", "client_portal", client_id, "Link de acesso do cliente renovado")
+            return self.json_response(201, {"token": token})
         if path == "/api/platform/companies":
             name=str(data.get("name","")).strip()
             slug=slugify(data.get("slug") or name)
@@ -780,7 +901,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if key in data and data[key] != saved.get(key):
                         return self.json_response(403, {"error": "Não é permitido alterar os dados de atribuição da ordem."})
                 updated = dict(saved)
-                for key in ("work", "materials", "status", "signature_name", "signature", "signature_at"):
+                for key in ("work", "materials", "status", "signature_name", "signature", "signature_at", "checklist", "photos"):
                     if key in data:
                         updated[key] = data[key]
                 data = updated
@@ -844,6 +965,13 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
                 if kind == "maintenance" and asset_id and (not asset_row or json.loads(asset_row[0]).get("client_id") != client_id):
                     return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
+            if kind == "assets" and data.get("maintenance_interval_months"):
+                tech_id = str(data.get("maintenance_technician_id", ""))
+                with connect() as db:
+                    tech = db.execute("SELECT 1 FROM memberships WHERE id=? AND organization_id=? AND role='technician' AND active=1",
+                                      (tech_id,user["organization_id"])).fetchone()
+                if not tech:
+                    return self.json_response(400, {"error": "Selecione um técnico ativo para a manutenção recorrente."})
             if role == "warehouse" and kind == "purchaseRequests" and data.get("id"):
                 if data.get("status") not in {"ordered", "received"}:
                     return self.json_response(403, {"error": "O almoxarifado pode atualizar pedidos aprovados para realizado ou recebido."})
@@ -885,6 +1013,18 @@ class Handler(SimpleHTTPRequestHandler):
                         asset["next_service"] = data.get("due")
                         db.execute("UPDATE records SET data=? WHERE organization_id=? AND kind='assets' AND id=?",
                                    (json.dumps(asset,ensure_ascii=False),user["organization_id"],asset["id"]))
+                if kind == "orders" and data.get("status") == "completed" and data.get("preventive_key") and data.get("asset_id"):
+                    row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='assets' AND id=?",
+                                     (user["organization_id"],data["asset_id"])).fetchone()
+                    if row:
+                        asset = json.loads(row[0])
+                        interval = asset.get("maintenance_interval_months")
+                        if interval:
+                            performed = datetime.now(timezone.utc).date()
+                            asset["last_service"] = performed.isoformat()
+                            asset["next_service"] = add_months(datetime.combine(performed, datetime.min.time()),interval).date().isoformat()
+                            db.execute("UPDATE records SET data=? WHERE organization_id=? AND kind='assets' AND id=?",
+                                       (json.dumps(asset,ensure_ascii=False),user["organization_id"],asset["id"]))
                 self.log_audit(db,user,"update" if existing else "create",kind,data["id"],f"Registro {kind} salvo")
             return self.json_response(200, data)
         except (ValueError, TypeError, AttributeError, OverflowError) as error:
@@ -916,6 +1056,48 @@ class Handler(SimpleHTTPRequestHandler):
         session_user={"id":platform_user["id"],"username":platform_user["username"],
                       "name":platform_user["name"]}
         return self.json_response(200,{"user":session_user},(("Set-Cookie",cookie),))
+
+    def generate_preventive_orders(self, user):
+        today = datetime.now(timezone.utc).date().isoformat()
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            assets = db.execute("SELECT id,data FROM records WHERE organization_id=? AND kind='assets'",
+                                (user["organization_id"],)).fetchall()
+            for row in assets:
+                asset = json.loads(row["data"])
+                interval = asset.get("maintenance_interval_months")
+                due = asset.get("next_service")
+                technician_id = asset.get("maintenance_technician_id")
+                if not interval or not due or due > today or not technician_id:
+                    continue
+                key = f"{asset['id']}:{due}"
+                if db.execute("SELECT 1 FROM records WHERE organization_id=? AND kind='orders' AND json_extract(data,'$.preventive_key')=?",
+                              (user["organization_id"],key)).fetchone():
+                    continue
+                technician = db.execute("""SELECT m.id,u.name FROM memberships m JOIN users u ON u.id=m.user_id
+                    WHERE m.id=? AND m.organization_id=? AND m.role='technician' AND m.active=1""",
+                    (technician_id,user["organization_id"])).fetchone()
+                if not technician:
+                    continue
+                client_row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='clients' AND id=?",
+                                        (user["organization_id"],asset.get("client_id"))).fetchone()
+                if not client_row:
+                    continue
+                client = json.loads(client_row[0])
+                order_id = str(uuid4())
+                now = datetime.now(timezone.utc)
+                order = {"id":order_id,"number":f"PREV-{now.year}-{order_id[:6].upper()}",
+                         "client_id":asset["client_id"],"technician_id":technician["id"],"technician":technician["name"],
+                         "asset_id":asset["id"],"title":f"Manutenção preventiva — {asset['name']}",
+                         "scheduled":due,"scheduled_time":"","duration_minutes":60,
+                         "summary":f"Manutenção preventiva recorrente para {client.get('name','cliente')}.",
+                         "status":"open","work":"","materials":"","signature":"","checklist_type":"preventive",
+                         "checklist":[{"label":label,"done":False} for label in
+                                       ("Inspecionar funcionamento geral","Verificar conexões e fixações","Testar operação e segurança","Registrar recomendações")],
+                         "photos":[],"preventive_key":key,"created_at":now.isoformat()}
+                db.execute("INSERT INTO records VALUES (?,?,?,?)",
+                           (user["organization_id"],"orders",order_id,json.dumps(order,ensure_ascii=False)))
+                self.log_audit(db,user,"create","orders",order_id,f"Ordem preventiva gerada para {asset['name']} ({due})")
 
     @staticmethod
     def log_audit(db,user,action,kind,record_id,summary):
@@ -1036,13 +1218,56 @@ class Handler(SimpleHTTPRequestHandler):
             for key in ("last_service", "next_service"):
                 if data.get(key):
                     datetime.strptime(data[key], "%Y-%m-%d")
+            interval = data.get("maintenance_interval_months")
+            if interval not in (None, ""):
+                numeric_interval = float(interval)
+                interval = int(numeric_interval)
+                if numeric_interval != interval or not 1 <= interval <= 36 or not data.get("next_service") or not data.get("maintenance_technician_id"):
+                    raise ValueError("Para ativar a recorrência, informe próxima data, intervalo de 1 a 36 meses e técnico responsável.")
+                data["maintenance_interval_months"] = interval
         if kind == "orders":
             if not data.get("client_id"):
                 raise ValueError("Selecione o cliente da ordem de serviço.")
+            if not str(data.get("title", "")).strip() or len(str(data.get("title", ""))) > 180:
+                raise ValueError("Informe uma descrição de serviço de até 180 caracteres.")
+            if data.get("status", "open") not in {"open", "in_progress", "completed"}:
+                raise ValueError("Situação da ordem de serviço inválida.")
             if data.get("signature") and not data.get("signature_name"):
                 raise ValueError("Informe o nome de quem assinou.")
             if data.get("status") == "completed" and (not data.get("signature", "").startswith("data:image/png;base64,") or not data.get("signature_name")):
                 raise ValueError("Uma ordem concluída precisa da assinatura PNG do cliente e do nome de quem assinou.")
+            for key in ("scheduled",):
+                if data.get(key):
+                    datetime.strptime(data[key], "%Y-%m-%d")
+            if data.get("scheduled_time"):
+                datetime.strptime(data["scheduled_time"], "%H:%M")
+            if data.get("duration_minutes") not in (None, "") and not 15 <= int(data["duration_minutes"]) <= 1440:
+                raise ValueError("A duração do atendimento deve ficar entre 15 minutos e 24 horas.")
+            checklist = data.get("checklist", [])
+            if not isinstance(checklist, list) or len(checklist) > 30 or any(not isinstance(item,dict) or not str(item.get("label","" )).strip() or len(str(item.get("label","")))>180 for item in checklist):
+                raise ValueError("A lista de verificação desta ordem está inválida.")
+            photos = data.get("photos", [])
+            if not isinstance(photos,list) or len(photos)>3:
+                raise ValueError("Anexe no máximo três fotos à ordem.")
+            signatures = {"image/png":b"\x89PNG\r\n\x1a\n","image/jpeg":b"\xff\xd8\xff","image/webp":None}
+            for photo in photos:
+                if not isinstance(photo,dict) or photo.get("mime") not in signatures or len(str(photo.get("name","")))>180:
+                    raise ValueError("Formato de foto inválido. Use PNG, JPEG ou WebP.")
+                prefix=f"data:{photo['mime']};base64,"
+                source=str(photo.get("data",""))
+                if not source.startswith(prefix):
+                    raise ValueError("A foto não corresponde ao formato informado.")
+                try:
+                    payload=base64.b64decode(source[len(prefix):],validate=True)
+                except ValueError:
+                    raise ValueError("Uma das fotos está corrompida.") from None
+                if not 0<len(payload)<=750_000:
+                    raise ValueError("Cada foto da ordem deve ter no máximo 750 KB.")
+                magic=signatures[photo["mime"]]
+                if magic and not payload.startswith(magic):
+                    raise ValueError("O conteúdo da foto não corresponde ao formato informado.")
+                if photo["mime"]=="image/webp" and (len(payload)<12 or payload[:4]!=b"RIFF" or payload[8:12]!=b"WEBP"):
+                    raise ValueError("O conteúdo da foto não corresponde ao formato WebP.")
         if kind == "maintenance":
             datetime.strptime(data.get("due", ""), "%Y-%m-%d")
             if not data.get("client_id") or not data.get("equipment"):

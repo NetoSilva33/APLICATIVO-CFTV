@@ -30,6 +30,14 @@ O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução ser
 ## Áreas incluídas
 
 - **Ordens de serviço:** abertura por cliente e equipamento, registro do serviço e materiais utilizados, situação do atendimento, assinatura desenhada com mouse ou tela sensível ao toque e impressão do documento em PDF pelo navegador.
+- **Agenda técnica:** visão dos atendimentos programados nos próximos sete dias, com data, horário, duração e técnico. A OS pode ser reprogramada pela administração ou supervisão.
+- **Preventivas recorrentes:** configure intervalo de 1 a 36 meses e um técnico para cada equipamento. Ao abrir ou atualizar o aplicativo depois do vencimento, ele cria uma OS preventiva uma única vez; ao concluir essa OS, calcula o próximo prazo.
+- **Checklist e fotos na OS:** listas iniciais para CFTV, acesso/automação ou atendimento geral, itens marcados durante o serviço e até três fotos de até 750 KB cada. Checklist, fotos e assinatura aparecem na impressão em PDF.
+- **Portal do cliente:** em **Clientes**, use **Link portal** para emitir um link revogável. O cliente vê somente seus equipamentos, ordens, fotos e manutenções e pode imprimir cada ordem em PDF. Gerar outro link invalida o anterior. O link precisa ser compartilhado pela equipe.
+- **Consulta por QR:** a página do equipamento mostra etiqueta imprimível e link direto para abri-lo no aplicativo. A imagem do QR é gerada pelo serviço externo QRServer e inclui apenas a URL do sistema e o identificador aleatório do equipamento; precisa de conexão para carregar.
+- **Modo offline do técnico:** o navegador guarda uma cópia local dos dados já carregados e permite salvar atualizações de ordens e manutenções atribuídas; a fila é enviada quando a conexão volta. Cadastros administrativos, estoque e aprovações exigem conexão. A cópia local fica neste navegador e é apagada ao sair da conta.
+- **Indicadores:** relatórios mostram ordens abertas e concluídas, ordens criadas nos últimos 30 dias, preventivas atrasadas, materiais com estoque baixo, compras aguardando aprovação e volume/conclusão por técnico.
+- **Atalhos de contato:** ordens com telefone ou e-mail do cliente oferecem links que preenchem uma mensagem no WhatsApp ou no programa de e-mail. A pessoa revisa e envia a mensagem; o sistema não dispara comunicações automaticamente.
 - **Clientes e equipamentos:** cadastro de clientes e equipamentos vinculados, fabricante, modelo, número de série ou local.
 - **Manutenção:** registro de visita, histórico por equipamento e datas da última e próxima manutenção, com alertas de vencimento.
 - **Almoxarifado:** catálogo editável de materiais com saldo físico, reservado e disponível, alerta de estoque baixo, localização e unidade por item (como caixa, unidade ou metro). Todos os perfis podem montar pedidos com vários itens do catálogo; almoxarifado e supervisão acompanham o fluxo, e o saldo físico é baixado quando a entrega é registrada. Dicas nos campos explicam as categorias e unidades.
@@ -54,9 +62,14 @@ O banco persistente fica em `data/gestao.db` e é criado automaticamente. `CFTV_
 
 Esta entrega é uma base para testes multempresa no próprio computador. O menu lateral rola quando as opções não cabem na tela. A versão ainda usa SQLite local e não inclui hospedagem pública, PostgreSQL, cobrança automática, convites por e-mail, envio de PDF por e-mail/WhatsApp, armazenamento de arquivo de manual dentro do app, assinatura digital certificada ou sincronização em nuvem. Para testar em vários aparelhos ou usar dados reais em produção, ainda é necessário configurar hospedagem com HTTPS, banco de dados gerenciado, backups e política de acesso adequada. Não exponha o servidor de desenvolvimento diretamente à internet.
 
+O modo offline mantém dados da empresa no armazenamento do navegador até a pessoa sair da conta; use-o somente em aparelhos controlados pela empresa. A recorrência é verificada quando o aplicativo consulta os dados, não por uma tarefa em segundo plano com o servidor fechado. A imagem de QR depende do QRServer; o endereço e o identificador aleatório do equipamento são enviados ao serviço para compor o QR, sem nome ou cadastro do cliente. Mensagens WhatsApp/e-mail são atalhos manuais. O portal de cliente é de consulta e impressão; o cliente ainda não assina nem altera ordens pelo portal.
+
 ## Verificações
 
 ```bash
 python3 -m unittest discover -s tests -v
 node --check static/app.js
+node --check static/client.js
+node --check static/sw.js
+python3 -m py_compile server.py tests/test_server.py
 ```

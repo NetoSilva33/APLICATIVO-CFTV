@@ -1,5 +1,5 @@
-const CACHE = 'segura-shell-v8';
-const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest', '/icon.svg', '/plataforma', '/platform.css', '/platform.js'];
+const CACHE = 'segura-shell-v9';
+const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest', '/icon.svg', '/plataforma', '/platform.css', '/platform.js', '/cliente', '/client.css', '/client.js'];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key))))));
 self.addEventListener('fetch', event => {

@@ -264,6 +264,57 @@ class AppTest(unittest.TestCase):
         reactivated=build_opener(HTTPCookieProcessor(CookieJar()))
         self.login(reactivated,'admin-assinante','subscriber-pass-123','assinante')
         self.assertEqual(self.get('/api/data',reactivated)['organization']['name'],'Assinante')
+    def test_customer_portal_is_client_scoped_and_revocable(self):
+        first=self.post('clients',{'name':'Cliente do portal','phone':'5511999990000'})
+        second=self.post('clients',{'name':'Outro cliente privado'})
+        self.post('assets',{'client_id':first['id'],'name':'Câmera portal','next_service':'2026-12-01'})
+        self.post('assets',{'client_id':second['id'],'name':'Câmera privada'})
+        link=self.post('client-portal/create-link',{'client_id':first['id']})
+        portal=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.post_as(portal,'client-portal/session',{'token':link['token']})
+        data=self.get('/api/client-portal/data',portal)
+        self.assertEqual(data['client']['id'],first['id'])
+        self.assertEqual([asset['name'] for asset in data['assets']],['Câmera portal'])
+        self.assertEqual(data['orders'],[])
+        self.post('users',{'name':'Técnico portal','username':'tecnico-portal','password':'portal-tech-pass-123','role':'technician'})
+        technician=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(technician,'tecnico-portal','portal-tech-pass-123')
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(technician,'client-portal/create-link',{'client_id':first['id']})
+        self.assertEqual(error.exception.code,403)
+        rotated=self.post('client-portal/create-link',{'client_id':first['id']})
+        self.assertNotEqual(link['token'],rotated['token'])
+        with self.assertRaises(HTTPError) as error:
+            self.get('/api/client-portal/data',portal)
+        self.assertEqual(error.exception.code,401)
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(build_opener(HTTPCookieProcessor(CookieJar())),'client-portal/session',{'token':link['token']})
+        self.assertEqual(error.exception.code,401)
+    def test_recurring_preventive_order_is_idempotent_and_advances_due_date(self):
+        company=self.platform_post('companies',{'name':'Recorrência','slug':'recorrencia','plan':'starter','admin_name':'Admin Preventiva','admin_username':'admin-preventiva','admin_password':'preventive-pass-123'})
+        org_id=company['company']['id']
+        admin=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(admin,'admin-preventiva','preventive-pass-123','recorrencia')
+        def post(kind,data):return self.post_as(admin,kind,data)
+        client=post('clients',{'name':'Cliente preventiva'})
+        post('users',{'name':'Técnico preventiva','username':'tecnico-preventiva','password':'tech-preventive-pass-123','role':'technician'})
+        tech=next(member for member in self.get('/api/data',admin)['team'] if member['name']=='Técnico preventiva')
+        due=(datetime.now(timezone.utc).date()-timedelta(days=1)).isoformat()
+        asset=post('assets',{'client_id':client['id'],'name':'Motor automático','next_service':due,'maintenance_interval_months':1,'maintenance_technician_id':tech['id']})
+        first=self.get('/api/data',admin)
+        orders=[o for o in first['orders'] if o.get('preventive_key')==asset['id']+':'+due]
+        self.assertEqual(len(orders),1)
+        self.assertEqual(orders[0]['technician_id'],tech['id'])
+        second=self.get('/api/data',admin)
+        self.assertEqual(len([o for o in second['orders'] if o.get('preventive_key')==asset['id']+':'+due]),1)
+        technician=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(technician,'tecnico-preventiva','tech-preventive-pass-123','recorrencia')
+        assigned=self.get('/api/data',technician)['orders'][0]
+        assigned.update({'status':'completed','signature':'data:image/png;base64,iVBORw0KGgo=','signature_name':'Cliente','signature_at':due})
+        self.post_as(technician,'orders',assigned)
+        updated_asset=next(a for a in self.get('/api/data',admin)['assets'] if a['id']==asset['id'])
+        self.assertGreater(updated_asset['next_service'],due)
+        self.assertEqual(updated_asset['last_service'],datetime.now(timezone.utc).date().isoformat())
     def test_legacy_database_migrates_without_losing_data(self):
         previous=server.DB
         legacy_path=Path(self.temp.name)/'legacy.db'
@@ -314,6 +365,7 @@ class AppTest(unittest.TestCase):
             server.DB=previous
     def test_home(self):
         with urlopen(self.base) as response: self.assertIn('Segura Gestão',response.read().decode())
+        with urlopen(self.base+'/cliente') as response:self.assertIn('client.js',response.read().decode())
         with urlopen(self.base+'/plataforma') as response:
             portal=response.read().decode()
             self.assertIn('PORTAL COMERCIAL',portal)
