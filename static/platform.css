@@ -13,6 +13,8 @@ body.platform-body{min-height:100vh;background:#f3f6f8}
 .company-table input,.company-table select{min-width:125px;margin:0}
 .company-table .company-name{min-width:180px}
 .company-table .company-code,.company-table .company-doc{margin-top:6px}
+.company-table .renew-option{display:flex;align-items:center;gap:6px;margin-top:7px;min-width:150px;font-size:11px;color:#405865}
+.company-table .renew-option input{width:16px;height:16px;min-width:16px;margin:0}
 .company-table td{min-width:125px}
 .company-table td:first-child{min-width:235px}
 .company-table td:last-child{text-align:left;min-width:105px}

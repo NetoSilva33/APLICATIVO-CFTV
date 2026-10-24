@@ -1,5 +1,6 @@
 """Segura Gestão: app local de operações para segurança eletrônica."""
 import base64
+import calendar
 import getpass
 import hashlib
 import hmac
@@ -28,6 +29,7 @@ KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchas
 SESSION_HOURS = 12
 PBKDF2_ROUNDS = 310_000
 PLAN_LIMITS = {"starter": 10, "pro": 50, "business": 500}
+BILLING_PERIOD_MONTHS = {"monthly": 1, "quarterly": 3, "semiannual": 6, "annual": 12}
 _schema_lock = threading.Lock()
 _initialized_databases = set()
 
@@ -58,6 +60,29 @@ def slugify(value):
     return re.sub(r"[^a-z0-9]+", "-", normalized).strip("-") or "empresa"
 
 
+def add_billing_period(start, period):
+    months = BILLING_PERIOD_MONTHS[period]
+    month_index = start.month - 1 + months
+    year = start.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return start.replace(year=year, month=month, day=day)
+
+
+def expiration_countdown(value, now=None):
+    if not value:
+        return None, False
+    try:
+        expiration = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None, False
+    if expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    seconds = (expiration - now).total_seconds()
+    return math.ceil(seconds / 86400), expiration <= now
+
+
 def initialize_schema(db):
     db.commit()
     db.execute("BEGIN IMMEDIATE")
@@ -65,6 +90,11 @@ def initialize_schema(db):
                and _table_exists(db, "users") and _table_exists(db, "sessions")
                and _table_exists(db, "records") and "organization_id" in _columns(db, "records"))
     if current:
+        organization_columns = _columns(db, "organizations")
+        if "billing_period" not in organization_columns:
+            db.execute("ALTER TABLE organizations ADD COLUMN billing_period TEXT NOT NULL DEFAULT 'monthly'")
+        if "subscription_ends_at" not in organization_columns:
+            db.execute("ALTER TABLE organizations ADD COLUMN subscription_ends_at TEXT")
         db.execute("""CREATE TABLE IF NOT EXISTS platform_users (
             id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
             salt BLOB NOT NULL, password_hash BLOB NOT NULL,
@@ -96,7 +126,8 @@ def initialize_schema(db):
         id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
         document TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT 'starter',
         status TEXT NOT NULL DEFAULT 'trial', trial_ends_at TEXT,
-        created_at TEXT NOT NULL)""")
+        created_at TEXT NOT NULL, billing_period TEXT NOT NULL DEFAULT 'monthly',
+        subscription_ends_at TEXT)""")
     db.execute("""CREATE TABLE users (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
         is_platform_admin INTEGER NOT NULL DEFAULT 0)""")
@@ -137,7 +168,8 @@ def initialize_schema(db):
         while db.execute("SELECT 1 FROM organizations WHERE slug=?", (slug,)).fetchone():
             slug, suffix = f"{base_slug}-{suffix}", suffix + 1
         now = datetime.now(timezone.utc).isoformat()
-        db.execute("INSERT INTO organizations VALUES (?,?,?,?,?,?,?,?)",
+        db.execute("""INSERT INTO organizations(id,name,slug,document,plan,status,trial_ends_at,created_at)
+            VALUES (?,?,?,?,?,?,?,?)""",
                    (organization_id, company_name, slug, str(profile.get("document", ""))[:40], "starter", "active", None, now))
         for row in db.execute("SELECT id,username,name,role,salt,password_hash,active,created FROM legacy_users_v1"):
             db.execute("INSERT INTO users VALUES (?,?,?,?)",
@@ -241,8 +273,9 @@ class Handler(SimpleHTTPRequestHandler):
                 JOIN users u ON u.id=m.user_id JOIN organizations o ON o.id=m.organization_id
                 WHERE s.token_hash=? AND s.expires>? AND m.active=1
                   AND o.status IN ('active','trial')
-                  AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)""",
-                (digest, now, now)).fetchone()
+                  AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)
+                  AND (o.status!='active' OR o.subscription_ends_at IS NULL OR o.subscription_ends_at>?)""",
+                (digest, now, now, now)).fetchone()
         if not row:
             return None
         return dict(row)
@@ -308,6 +341,8 @@ class Handler(SimpleHTTPRequestHandler):
                 company = dict(row)
                 company["user_count"] = int(company["user_count"])
                 company["user_limit"] = PLAN_LIMITS.get(company["plan"], PLAN_LIMITS["starter"])
+                company["expires_at"] = company["trial_ends_at"] if company["status"] == "trial" else company["subscription_ends_at"]
+                company["days_remaining"], company["expired"] = expiration_countdown(company["expires_at"])
                 companies.append(company)
             return self.json_response(200, {"companies": companies})
         if path == "/api/data":
@@ -434,8 +469,10 @@ class Handler(SimpleHTTPRequestHandler):
                     o.status AS organization_status,o.trial_ends_at FROM memberships m JOIN users u ON u.id=m.user_id
                     JOIN organizations o ON o.id=m.organization_id WHERE m.username=? AND m.active=1
                     AND o.status IN ('active','trial')
-                    AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)"""
-                params=[username,datetime.now(timezone.utc).isoformat()]
+                    AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)
+                    AND (o.status!='active' OR o.subscription_ends_at IS NULL OR o.subscription_ends_at>?)"""
+                now=datetime.now(timezone.utc).isoformat()
+                params=[username,now,now]
                 if company_slug:
                     query+=" AND o.slug=?"
                     params.append(company_slug)
@@ -521,11 +558,19 @@ class Handler(SimpleHTTPRequestHandler):
             status=str(data.get("status",""))
             if plan not in PLAN_LIMITS or status not in {"trial","active","suspended"}:
                 return self.json_response(400,{"error":"Plano ou situação inválidos."})
+            requested_period=data.get("billing_period")
+            if requested_period is not None and str(requested_period) not in BILLING_PERIOD_MONTHS:
+                return self.json_response(400,{"error":"Escolha um período mensal, trimestral, semestral ou anual."})
+            renew=data.get("renew") is True
+            if renew and status!="active":
+                return self.json_response(400,{"error":"Para iniciar ou renovar um prazo, selecione a situação Ativa."})
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                target=db.execute("SELECT id,name,slug,document,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
+                target=db.execute("""SELECT id,name,slug,document,plan,status,trial_ends_at,
+                    billing_period,subscription_ends_at FROM organizations WHERE id=?""",(org_id,)).fetchone()
                 if not target:
                     return self.json_response(404,{"error":"Empresa não encontrada."})
+                billing_period=str(requested_period if requested_period is not None else target["billing_period"] or "monthly")
                 users_count=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=?",(org_id,)).fetchone()[0]
                 if users_count>PLAN_LIMITS[plan]:
                     return self.json_response(400,{"error":f"Esse plano permite até {PLAN_LIMITS[plan]} acessos; a empresa já tem {users_count}."})
@@ -538,11 +583,24 @@ class Handler(SimpleHTTPRequestHandler):
                 duplicate=db.execute("SELECT 1 FROM organizations WHERE slug=? AND id<>?",(slug,org_id)).fetchone()
                 if duplicate:
                     return self.json_response(409,{"error":"Esse código já está sendo usado por outra empresa."})
-                db.execute("UPDATE organizations SET name=?,slug=?,document=?,plan=?,status=? WHERE id=?",
-                           (name,slug,document,plan,status,org_id))
+                now=datetime.now(timezone.utc)
+                subscription_end=target["subscription_ends_at"]
+                days_left,expired=expiration_countdown(subscription_end,now)
+                if status=="active" and (not subscription_end or expired) and not renew:
+                    return self.json_response(400,{"error":"Marque iniciar/renovar prazo para ativar uma empresa sem vigência ou com o prazo vencido."})
+                if renew:
+                    base=now
+                    if subscription_end and days_left is not None and not expired:
+                        base=datetime.fromisoformat(subscription_end)
+                        if base.tzinfo is None:
+                            base=base.replace(tzinfo=timezone.utc)
+                    subscription_end=add_billing_period(base,billing_period).isoformat()
+                db.execute("""UPDATE organizations SET name=?,slug=?,document=?,plan=?,status=?,
+                    billing_period=?,subscription_ends_at=? WHERE id=?""",
+                           (name,slug,document,plan,status,billing_period,subscription_end,org_id))
                 platform_actor={**user,"organization_id":org_id,"name":"Plataforma"}
                 self.log_audit(db,platform_actor,"update","organization",org_id,
-                               f"Empresa {name}; código {target['slug']} → {slug}; plano {target['plan']} → {plan}; situação {target['status']} → {status}")
+                               f"Empresa {name}; código {target['slug']} → {slug}; plano {target['plan']} → {plan}; situação {target['status']} → {status}; período {billing_period}; vigência {subscription_end or 'não definida'}")
             return self.json_response(200,{"ok":True})
 
         if path == "/api/organization/update":

@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -195,7 +196,7 @@ class AppTest(unittest.TestCase):
         self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'suspended'})
         with self.assertRaises(HTTPError) as error: tenant_b.open(self.base+'/api/data')
         self.assertEqual(error.exception.code,401)
-        self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'active'})
+        self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'active','billing_period':'monthly','renew':True})
         self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
         self.assertEqual(self.get('/api/data',tenant_b)['organization']['name'],'Empresa B')
         with self.assertRaises(HTTPError) as error:
@@ -216,8 +217,53 @@ class AppTest(unittest.TestCase):
         self.platform_post('companies/update',{'id':root_org,'plan':'starter','status':'suspended'})
         with self.assertRaises(HTTPError) as error: self.get('/api/data')
         self.assertEqual(error.exception.code,401)
-        self.assertEqual(len(self.get('/api/platform/companies',self.platform_client)['companies']),2)
-        self.platform_post('companies/update',{'id':root_org,'plan':'starter','status':'active'})
+        self.assertTrue(any(row['id']==root_org for row in self.get('/api/platform/companies',self.platform_client)['companies']))
+        self.platform_post('companies/update',{'id':root_org,'plan':'starter','status':'active','billing_period':'monthly','renew':True})
+
+    def test_subscription_countdown_and_renewal(self):
+        created=self.platform_post('companies',{'name':'Assinante','slug':'assinante','plan':'starter','admin_name':'Admin Assinante','admin_username':'admin-assinante','admin_password':'subscriber-pass-123'})
+        org_id=created['company']['id']
+        company=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==org_id)
+        self.assertEqual(company['billing_period'],'monthly')
+        self.assertEqual(company['expires_at'],company['trial_ends_at'])
+        self.assertGreaterEqual(company['days_remaining'],13)
+        self.assertLessEqual(company['days_remaining'],14)
+        tenant=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(tenant,'admin-assinante','subscriber-pass-123','assinante')
+        with self.assertRaises(HTTPError) as error:
+            self.platform_post('companies/update',{'id':org_id,'plan':'starter','status':'active','billing_period':'monthly'})
+        self.assertEqual(error.exception.code,400)
+        self.platform_post('companies/update',{'id':org_id,'plan':'starter','status':'active','billing_period':'monthly','renew':True})
+        company=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==org_id)
+        first_expiration=datetime.fromisoformat(company['subscription_ends_at'])
+        self.assertEqual(company['expires_at'],company['subscription_ends_at'])
+        self.assertGreaterEqual(company['days_remaining'],28)
+        self.assertLessEqual(company['days_remaining'],31)
+        self.platform_post('companies/update',{'id':org_id,'plan':'starter','status':'active','billing_period':'annual','renew':True})
+        renewed=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==org_id)
+        annual_expiration=datetime.fromisoformat(renewed['subscription_ends_at'])
+        self.assertEqual(renewed['billing_period'],'annual')
+        self.assertGreaterEqual(annual_expiration-first_expiration,timedelta(days=360))
+        expired_at=(datetime.now(timezone.utc)-timedelta(days=2)).isoformat()
+        with server.connect() as db:
+            db.execute('UPDATE organizations SET subscription_ends_at=? WHERE id=?',(expired_at,org_id))
+        with self.assertRaises(HTTPError) as error:
+            tenant.open(self.base+'/api/data')
+        self.assertEqual(error.exception.code,401)
+        with self.assertRaises(HTTPError) as error:
+            self.login(build_opener(HTTPCookieProcessor(CookieJar())),'admin-assinante','subscriber-pass-123','assinante')
+        self.assertEqual(error.exception.code,401)
+        expired=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==org_id)
+        self.assertTrue(expired['expired'])
+        self.assertLess(expired['days_remaining'],0)
+        self.platform_post('companies/update',{'id':org_id,'plan':'starter','status':'active','billing_period':'quarterly','renew':True})
+        renewed=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==org_id)
+        self.assertEqual(renewed['billing_period'],'quarterly')
+        self.assertGreaterEqual(renewed['days_remaining'],89)
+        self.assertLessEqual(renewed['days_remaining'],92)
+        reactivated=build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(reactivated,'admin-assinante','subscriber-pass-123','assinante')
+        self.assertEqual(self.get('/api/data',reactivated)['organization']['name'],'Assinante')
     def test_legacy_database_migrates_without_losing_data(self):
         previous=server.DB
         legacy_path=Path(self.temp.name)/'legacy.db'
