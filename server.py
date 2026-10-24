@@ -377,6 +377,12 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as db:
                 has_users = db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]
             return self.json_response(200, {"setupRequired": not bool(has_users), "user": self.public_company_user(self.current_user())})
+        if path == "/api/version":
+            try:
+                version = (ROOT / "data" / "build-version.txt").read_text(encoding="utf-8").strip()
+            except OSError:
+                version = "local"
+            return self.json_response(200, {"version":version or "local"})
         if path == "/api/platform/session":
             with connect() as db:
                 has_platform_users = db.execute("SELECT EXISTS(SELECT 1 FROM platform_users)").fetchone()[0]

@@ -365,6 +365,7 @@ class AppTest(unittest.TestCase):
             server.DB=previous
     def test_home(self):
         with urlopen(self.base) as response: self.assertIn('Segura Gestão',response.read().decode())
+        self.assertTrue(self.get('/api/version')['version'])
         with urlopen(self.base+'/cliente') as response:self.assertIn('client.js',response.read().decode())
         with urlopen(self.base+'/plataforma') as response:
             portal=response.read().decode()

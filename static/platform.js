@@ -3,12 +3,13 @@ const $=selector=>document.querySelector(selector);
 const esc=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const plans=[['starter','Essencial · 10 acessos'],['pro','Profissional · 50 acessos'],['business','Empresa · 500 acessos']];
 const billingPeriods=[['monthly','Mensal'],['quarterly','Trimestral'],['semiannual','Semestral'],['annual','Anual']];
-let user=null,companies=[];
+let user=null,companies=[],platformVersion=null,platformUpdatePending=false,platformHasUnsavedChanges=false,platformUpdateNotice=false;
 
 async function api(path,body){
   const response=await fetch('/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const result=await response.json();
   if(!response.ok)throw Error(result.error||'Não foi possível concluir.');
+  platformHasUnsavedChanges=false;
   return result;
 }
 async function getJson(path){
@@ -70,6 +71,8 @@ async function loadCompanies(search=''){
   $('#stat-trial').textContent=companies.filter(company=>company.status==='trial').length;
   $('#stat-suspended').textContent=companies.filter(company=>company.status==='suspended').length;
   renderCompanies(filtered);
+  platformHasUnsavedChanges=false;
+  if(platformUpdatePending)setTimeout(pollPlatformVersion,250);
 }
 async function showPortal(){
   $('#platform-user').textContent=`${user.name} · Vendedor`;
@@ -97,4 +100,8 @@ async function start(){
   }catch(error){$('#platform-app').innerHTML=`<section class="platform-notice"><h1>Servidor indisponível</h1><p>${esc(error.message)}</p></section>`}
 }
 $('#platform-logout').onclick=async()=>{try{await api('platform/logout',{});user=null;renderLogin('Sessão encerrada.')}catch(error){toast(error.message)}};
+document.addEventListener('input',event=>{if(event.target.closest('#platform-app form, #company-table'))platformHasUnsavedChanges=true});
+document.addEventListener('change',event=>{if(event.target.closest('#platform-app form, #company-table'))platformHasUnsavedChanges=true});
+async function pollPlatformVersion(){try{const response=await fetch('/api/version',{cache:'no-store'});if(!response.ok)return;const result=await response.json();if(!platformVersion){platformVersion=result.version;return}if(result.version!==platformVersion){platformUpdatePending=true;if(platformHasUnsavedChanges){if(!platformUpdateNotice){toast('Há uma atualização pronta. Salve o formulário antes de aplicá-la.');platformUpdateNotice=true}}else location.reload()}}catch{}}
+setInterval(pollPlatformVersion,60000);pollPlatformVersion();
 start();

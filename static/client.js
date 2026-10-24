@@ -1,6 +1,7 @@
 'use strict';
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const date=s=>s?new Date(s+'T12:00:00').toLocaleDateString('pt-BR'):'—';
+let portalBuildVersion=null;
 async function api(path,body){const r=await fetch('/api/client-portal/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'same-origin'});const out=await r.json();if(!r.ok)throw Error(out.error||'Não foi possível abrir o portal.');return out}
 async function load(){
   const token=location.hash.slice(1);if(token){history.replaceState(null,'',location.pathname);await api('session',{token})}
@@ -12,3 +13,5 @@ async function load(){
   $('.portal-logout').onclick=async()=>{await api('logout',{});location.replace('/cliente')};
 }
 load().catch(error=>{$('#portal-content').innerHTML=`<section class="portal-entry"><h1>Portal indisponível</h1><p>${esc(error.message)}</p><p class="helper">Peça à empresa um novo link de acesso, se necessário.</p></section>`});
+async function checkPortalVersion(){try{const response=await fetch('/api/version',{cache:'no-store'});if(!response.ok)return;const result=await response.json();if(!portalBuildVersion)portalBuildVersion=result.version;else if(result.version!==portalBuildVersion)location.reload()}catch{}}
+setInterval(checkPortalVersion,60000);checkPortalVersion();
