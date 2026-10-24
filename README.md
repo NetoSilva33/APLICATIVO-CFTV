@@ -1,6 +1,6 @@
 # Segura Gestão — Segurança eletrônica
 
-Aplicativo web responsivo e instalável como PWA, pensado para operação de empresas de segurança eletrônica em computador e celular. O servidor atual usa SQLite local e a biblioteca padrão do Python; não precisa de pacotes externos.
+Aplicativo web responsivo e instalável como PWA, pensado para operação de empresas de segurança eletrônica em computador e celular. A versão atual oferece uma base multempresa de testes usando SQLite local e a biblioteca padrão do Python; não precisa de pacotes externos.
 
 ## Executar
 
@@ -37,13 +37,21 @@ O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução ser
 - **Manuais técnicos:** catálogo de documentos e referências fornecidos pela empresa, com links para os arquivos ou páginas oficiais.
 - **Acessos:** administrador controla todo o sistema e as contas, pode editar nome, usuário, perfil, situação e senha, além de excluir contas; o sistema impede excluir a própria conta ou remover o último administrador ativo, encerra sessões da conta editada e mantém ordens e solicitações históricas após uma exclusão. Supervisor administra clientes, equipamentos, ordens e acompanha solicitações; técnico vê apenas suas ordens atribuídas, os clientes/equipamentos ligados a elas, as manutenções correspondentes, manuais e seus próprios pedidos; almoxarifado administra o catálogo e atualiza os pedidos de estoque e compras. Todos os perfis podem consultar o catálogo e abrir solicitações de material ou compra. Senhas são armazenadas com derivação PBKDF2 e a sessão usa cookie HttpOnly.
 
+## Empresas e planos de teste
+
+Na primeira execução, informe o nome da sua empresa e crie o primeiro administrador. Esse primeiro administrador também recebe o acesso **Plataforma**, de onde pode cadastrar empresas para teste e criar o primeiro administrador de cada uma. Cada empresa tem seu próprio cadastro de clientes, funcionários, ordens, equipamentos, estoque e solicitações. Os dados e as contas são filtrados pela empresa também no servidor.
+
+O **código da empresa** aparece na área Empresa. Funcionários podem informá-lo na tela de login; se o nome de usuário for exclusivo, o código pode ficar vazio. O administrador da plataforma pode acompanhar as empresas, alterar o plano de teste e suspender ou reativar o acesso. Os planos Essencial, Profissional e Empresa limitam os acessos a 10, 50 e 500, respectivamente. Empresas cadastradas pela plataforma começam com uma avaliação de 14 dias. A gestão de planos é manual nesta versão: cobrança e renovação automáticas ainda não estão conectadas.
+
+Administradores e supervisores têm abas de alertas, relatórios e auditoria. O administrador também pode exportar os dados da própria empresa em JSON pela área Empresa. Instalações antigas com um banco de dados de uma única empresa são migradas automaticamente no primeiro início desta versão. Faça uma cópia do arquivo `data/gestao.db` antes de atualizar.
+
 Para salvar uma ordem em PDF, abra a ordem e escolha **Salvar ordem em PDF**. Na janela do navegador, selecione **Salvar como PDF**. A assinatura fica armazenada como imagem no banco SQLite junto com a ordem.
 
 ## Dados e preparo para uso real
 
 O banco persistente fica em `data/gestao.db` e é criado automaticamente. `CFTV_DB` permite escolher outro caminho. Para backup, feche o servidor e copie a pasta `data`; não envie o banco ao GitHub. Os dados que já estavam no banco permanecem armazenados.
 
-Esta entrega é uma base inicial: não inclui envio de PDF por e-mail/WhatsApp, armazenamento de arquivo de manual dentro do app, assinatura digital certificada, sincronização em nuvem ou implantação pública. O modo local ainda não dá acesso pelo celular usando outra rede. Antes de usar com dados de clientes em produção, faça implantação com HTTPS, controle de backup e política de acesso adequada.
+Esta entrega é uma base para testes multempresa no próprio computador. Ela ainda usa SQLite local e não inclui hospedagem pública, PostgreSQL, cobrança automática, convites por e-mail, envio de PDF por e-mail/WhatsApp, armazenamento de arquivo de manual dentro do app, assinatura digital certificada ou sincronização em nuvem. Para testar em vários aparelhos ou usar dados reais em produção, ainda é necessário configurar hospedagem com HTTPS, banco de dados gerenciado, backups e política de acesso adequada. Não exponha o servidor de desenvolvimento diretamente à internet.
 
 ## Verificações
 

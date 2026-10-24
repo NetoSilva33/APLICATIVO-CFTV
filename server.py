@@ -5,8 +5,11 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
+import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -21,20 +24,127 @@ ROLES = {"admin", "supervisor", "technician", "warehouse"}
 KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "inventoryItems", "manuals", "products", "quotes", "company"}
 SESSION_HOURS = 12
 PBKDF2_ROUNDS = 310_000
+PLAN_LIMITS = {"starter": 10, "pro": 50, "business": 500}
+_schema_lock = threading.Lock()
+_initialized_databases = set()
 
 
 def connect():
-    DB.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB, timeout=10)
+    path = Path(DB)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=20)
     db.row_factory = sqlite3.Row
-    db.execute("CREATE TABLE IF NOT EXISTS records (kind TEXT, id TEXT, data TEXT NOT NULL, PRIMARY KEY(kind,id))")
-    db.execute("""CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-        role TEXT NOT NULL, salt BLOB NOT NULL, password_hash BLOB NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL)""")
-    db.execute("CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires TEXT NOT NULL)")
-    db.commit()
+    key = str(path.resolve())
+    with _schema_lock:
+        if key not in _initialized_databases:
+            initialize_schema(db)
+            _initialized_databases.add(key)
     return db
+
+
+def _table_exists(db, name):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _columns(db, name):
+    return {row[1] for row in db.execute(f"PRAGMA table_info({name})")}
+
+
+def slugify(value):
+    normalized = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii").lower()
+    return re.sub(r"[^a-z0-9]+", "-", normalized).strip("-") or "empresa"
+
+
+def initialize_schema(db):
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    current = (_table_exists(db, "organizations") and _table_exists(db, "memberships")
+               and _table_exists(db, "users") and _table_exists(db, "sessions")
+               and _table_exists(db, "records") and "organization_id" in _columns(db, "records"))
+    if current:
+        db.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
+            id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT,
+            actor_name TEXT NOT NULL, action TEXT NOT NULL, kind TEXT NOT NULL,
+            record_id TEXT, summary TEXT NOT NULL, created_at TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_records_org_kind ON records(organization_id,kind)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_memberships_org ON memberships(organization_id,role,active)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_audit_org_time ON audit_logs(organization_id,created_at)")
+        db.commit()
+        return
+
+    old_users = _table_exists(db, "users") and "username" in _columns(db, "users")
+    old_sessions = _table_exists(db, "sessions") and "user_id" in _columns(db, "sessions")
+    old_records = _table_exists(db, "records") and "organization_id" not in _columns(db, "records")
+    if old_users:
+        db.execute("ALTER TABLE users RENAME TO legacy_users_v1")
+    if old_sessions:
+        db.execute("ALTER TABLE sessions RENAME TO legacy_sessions_v1")
+    if old_records:
+        db.execute("ALTER TABLE records RENAME TO legacy_records_v1")
+
+    db.execute("""CREATE TABLE organizations (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+        document TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT 'starter',
+        status TEXT NOT NULL DEFAULT 'trial', trial_ends_at TEXT,
+        created_at TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE users (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
+        is_platform_admin INTEGER NOT NULL DEFAULT 0)""")
+    db.execute("""CREATE TABLE memberships (
+        id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT NOT NULL,
+        username TEXT NOT NULL, role TEXT NOT NULL, salt BLOB NOT NULL,
+        password_hash BLOB NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL, UNIQUE(organization_id,username),
+        UNIQUE(organization_id,user_id))""")
+    db.execute("""CREATE TABLE sessions (
+        token_hash TEXT PRIMARY KEY, membership_id TEXT NOT NULL, expires TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE records (
+        organization_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
+        data TEXT NOT NULL, PRIMARY KEY(organization_id,kind,id))""")
+    db.execute("""CREATE TABLE audit_logs (
+        id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT,
+        actor_name TEXT NOT NULL, action TEXT NOT NULL, kind TEXT NOT NULL,
+        record_id TEXT, summary TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
+    if old_users:
+        profile = {}
+        if old_records:
+            row = db.execute("SELECT data FROM legacy_records_v1 WHERE kind='company' ORDER BY rowid LIMIT 1").fetchone()
+            if row:
+                try:
+                    profile = json.loads(row[0])
+                except (json.JSONDecodeError, TypeError):
+                    profile = {}
+        organization_id = str(uuid4())
+        company_name = str(profile.get("name") or "Empresa principal").strip()[:180]
+        base_slug, slug, suffix = slugify(company_name), slugify(company_name), 2
+        while db.execute("SELECT 1 FROM organizations WHERE slug=?", (slug,)).fetchone():
+            slug, suffix = f"{base_slug}-{suffix}", suffix + 1
+        legacy_admin = db.execute("SELECT id FROM legacy_users_v1 WHERE role='admin' AND active=1 ORDER BY created,id LIMIT 1").fetchone()
+        now = datetime.now(timezone.utc).isoformat()
+        db.execute("INSERT INTO organizations VALUES (?,?,?,?,?,?,?,?)",
+                   (organization_id, company_name, slug, str(profile.get("document", ""))[:40], "starter", "active", None, now))
+        for row in db.execute("SELECT id,username,name,role,salt,password_hash,active,created FROM legacy_users_v1"):
+            db.execute("INSERT INTO users VALUES (?,?,?,?)",
+                       (row[0], row[2], row[7], int(legacy_admin and row[0] == legacy_admin[0])))
+            db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
+                       (row[0], organization_id, row[0], row[1], row[3], row[4], row[5], row[6], row[7]))
+        if old_sessions:
+            db.execute("""INSERT INTO sessions(token_hash,membership_id,expires)
+                SELECT s.token_hash,s.user_id,s.expires FROM legacy_sessions_v1 s
+                JOIN memberships m ON m.id=s.user_id""")
+        if old_records:
+            db.execute("INSERT INTO records(organization_id,kind,id,data) SELECT ?,kind,id,data FROM legacy_records_v1",
+                       (organization_id,))
+        if old_sessions:
+            db.execute("DROP TABLE legacy_sessions_v1")
+        db.execute("DROP TABLE legacy_users_v1")
+        if old_records:
+            db.execute("DROP TABLE legacy_records_v1")
+    db.execute("CREATE INDEX idx_records_org_kind ON records(organization_id,kind)")
+    db.execute("CREATE INDEX idx_memberships_org ON memberships(organization_id,role,active)")
+    db.execute("CREATE INDEX idx_audit_org_time ON audit_logs(organization_id,created_at)")
+    db.commit()
 
 
 def password_hash(password, salt):
@@ -76,15 +186,29 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception:
             return None
         digest = hashlib.sha256(raw.encode()).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
         with connect() as db:
-            query = "SELECT u.id,u.username,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>? AND u.active=1"
-            row = db.execute(query, (digest, datetime.now(timezone.utc).isoformat())).fetchone()
-        return dict(row) if row else None
+            row = db.execute("""SELECT u.id AS account_id,m.id AS id,m.username,u.name,m.role,
+                m.organization_id,o.name AS organization_name,o.slug AS organization_slug,
+                o.document AS organization_document,o.plan AS organization_plan,
+                o.status AS organization_status,o.trial_ends_at,u.is_platform_admin
+                FROM sessions s JOIN memberships m ON m.id=s.membership_id
+                JOIN users u ON u.id=m.user_id JOIN organizations o ON o.id=m.organization_id
+                WHERE s.token_hash=? AND s.expires>? AND m.active=1
+                  AND ((o.status IN ('active','trial')
+                        AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?))
+                       OR u.is_platform_admin=1)""",
+                (digest, now, now)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["is_platform_admin"] = bool(result["is_platform_admin"])
+        return result
 
     def require_user(self):
         user = self.current_user()
         if not user:
-            self.json_response(401, {"error": "Sua sessão terminou. Entre novamente."})
+            self.json_response(401, {"error": "Sua sessão terminou ou a empresa está suspensa. Entre novamente."})
             return None
         return user
 
@@ -94,13 +218,50 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as db:
                 has_users = db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]
             return self.json_response(200, {"setupRequired": not bool(has_users), "user": self.current_user()})
+        if path == "/api/platform/companies":
+            user = self.require_user()
+            if not user:
+                return
+            if not user["is_platform_admin"]:
+                return self.json_response(403, {"error": "Somente a administração da plataforma pode ver as empresas."})
+            with connect() as db:
+                rows = db.execute("""SELECT o.*,(SELECT COUNT(*) FROM memberships m WHERE m.organization_id=o.id) AS user_count
+                    FROM organizations o ORDER BY o.created_at DESC""").fetchall()
+            companies = []
+            for row in rows:
+                company = dict(row)
+                company["user_count"] = int(company["user_count"])
+                company["user_limit"] = PLAN_LIMITS.get(company["plan"], PLAN_LIMITS["starter"])
+                companies.append(company)
+            return self.json_response(200, {"companies": companies})
+        if path == "/api/organization/export":
+            user = self.require_user()
+            if not user:
+                return
+            if user["role"] != "admin":
+                return self.json_response(403, {"error": "Somente o administrador da empresa pode exportar os dados."})
+            with connect() as db:
+                records = []
+                for row in db.execute("SELECT kind,id,data FROM records WHERE organization_id=? ORDER BY rowid",
+                                      (user["organization_id"],)):
+                    record = json.loads(row[2])
+                    record.update({"kind": row[0], "id": row[1]})
+                    records.append(record)
+                members = [dict(username=row[0],name=row[1],role=row[2],active=bool(row[3]))
+                           for row in db.execute("""SELECT m.username,u.name,m.role,m.active FROM memberships m
+                               JOIN users u ON u.id=m.user_id WHERE m.organization_id=? ORDER BY u.name""",
+                               (user["organization_id"],))]
+                audit = [dict(actor=row[0],action=row[1],kind=row[2],record_id=row[3],summary=row[4],created_at=row[5])
+                         for row in db.execute("SELECT actor_name,action,kind,record_id,summary,created_at FROM audit_logs WHERE organization_id=? ORDER BY created_at",
+                                                (user["organization_id"],))]
+            return self.json_response(200, {"organization": {"id":user["organization_id"],"name":user["organization_name"],"slug":user["organization_slug"],"document":user["organization_document"]},"members":members,"records":records,"audit":audit})
         if path == "/api/data":
             user = self.require_user()
             if not user:
                 return
             with connect() as db:
                 records = {key: [] for key in KINDS}
-                for kind, data in db.execute("SELECT kind,data FROM records ORDER BY rowid"):
+                for kind, data in db.execute("SELECT kind,data FROM records WHERE organization_id=? ORDER BY rowid", (user["organization_id"],)):
                     if kind in records:
                         records[kind].append(json.loads(data))
                 reserved = {}
@@ -110,9 +271,8 @@ class Handler(SimpleHTTPRequestHandler):
                             item_id = item.get("item_id")
                             reserved[item_id] = reserved.get(item_id, 0) + float(item.get("quantity", 0))
                 records["inventoryItems"] = [
-                    {**item,
-                     "reserved_quantity": reserved.get(item["id"], 0),
-                     "available_quantity": max(0, float(item.get("quantity", 0)) - reserved.get(item["id"], 0))}
+                    {**item,"reserved_quantity":reserved.get(item["id"],0),
+                     "available_quantity":max(0,float(item.get("quantity",0))-reserved.get(item["id"],0))}
                     for item in records["inventoryItems"]
                 ]
                 result = {key: [] for key in KINDS}
@@ -134,13 +294,47 @@ class Handler(SimpleHTTPRequestHandler):
                     result["manuals"] = records["manuals"]
                 else:
                     result = records
+                result["organization"] = {"id":user["organization_id"],"name":user["organization_name"],
+                    "slug":user["organization_slug"],"document":user["organization_document"],
+                    "plan":user["organization_plan"],"status":user["organization_status"],
+                    "trial_ends_at":user["trial_ends_at"]}
                 if user["role"] == "admin":
-                    result["users"] = [dict(id=r[0], username=r[1], name=r[2], role=r[3], active=bool(r[4]))
-                                       for r in db.execute("SELECT id,username,name,role,active FROM users ORDER BY name")]
-                if user["role"] in {"admin", "supervisor"}:
-                    result["team"] = [dict(id=r[0], name=r[1], role=r[2])
-                                      for r in db.execute("SELECT id,name,role FROM users WHERE active=1 AND role='technician' ORDER BY name")]
-            return self.json_response(200, result)
+                    result["users"] = [dict(id=r[0],username=r[1],name=r[2],role=r[3],active=bool(r[4]))
+                        for r in db.execute("""SELECT m.id,m.username,u.name,m.role,m.active FROM memberships m
+                            JOIN users u ON u.id=m.user_id WHERE m.organization_id=? ORDER BY u.name""",
+                            (user["organization_id"],))]
+                if user["role"] in {"admin","supervisor"}:
+                    result["team"] = [dict(id=r[0],name=r[1],role=r[2])
+                        for r in db.execute("""SELECT m.id,u.name,m.role FROM memberships m JOIN users u ON u.id=m.user_id
+                            WHERE m.organization_id=? AND m.active=1 AND m.role='technician' ORDER BY u.name""",
+                            (user["organization_id"],))]
+                    result["auditLogs"] = [dict(id=r[0],actor=r[1],action=r[2],kind=r[3],record_id=r[4],summary=r[5],created_at=r[6])
+                        for r in db.execute("""SELECT id,actor_name,action,kind,record_id,summary,created_at FROM audit_logs
+                            WHERE organization_id=? ORDER BY created_at DESC LIMIT 100""", (user["organization_id"],))]
+            alerts=[]
+            today=datetime.now(timezone.utc).date()
+            for asset in result.get("assets",[]):
+                due=asset.get("next_service")
+                if due:
+                    try:
+                        days=(datetime.strptime(due,"%Y-%m-%d").date()-today).days
+                        if days<=30:
+                            alerts.append({"kind":"maintenance","title":asset.get("name","Equipamento"),"detail":"Atrasada" if days<0 else ("Vence hoje" if days==0 else f"Vence em {days} dias"),"severity":"late" if days<0 else "soon"})
+                    except ValueError:
+                        pass
+            for item in result.get("inventoryItems",[]):
+                if float(item.get("available_quantity",0))<=float(item.get("minimum_quantity",0)):
+                    alerts.append({"kind":"stock","title":item.get("name","Material"),"detail":"Estoque baixo","severity":"late"})
+            if user["role"] in {"admin","supervisor","warehouse"}:
+                for request in result.get("stockRequests",[]):
+                    if request.get("status")=="pending":
+                        alerts.append({"kind":"stockRequest","title":request.get("item","Pedido de material"),"detail":"Solicitação aguardando análise","severity":"soon"})
+            if user["role"] in {"admin","supervisor"}:
+                for request in result.get("purchaseRequests",[]):
+                    if request.get("status")=="pending":
+                        alerts.append({"kind":"purchase","title":request.get("item","Compra"),"detail":"Compra aguardando aprovação","severity":"soon"})
+            result["alerts"]=alerts
+            return self.json_response(200,result)
         if path.startswith("/api/"):
             return self.json_response(404, {"error": "Endereço não encontrado."})
         return super().do_GET()
@@ -158,26 +352,55 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/setup":
             username = str(data.get("username", "")).strip().lower()
             name, password = str(data.get("name", "")).strip(), str(data.get("password", ""))
-            if not username or len(username) > 80 or not name or len(name) > 150 or len(password) < 12:
-                return self.json_response(400, {"error": "Informe usuário e nome; a senha inicial precisa ter pelo menos 12 caracteres."})
+            company_name = str(data.get("company_name", "")).strip()
+            if not username or len(username) > 80 or not name or len(name) > 150 or not company_name or len(company_name) > 180 or len(password) < 12:
+                return self.json_response(400, {"error": "Informe empresa, usuário e nome; a senha inicial precisa ter pelo menos 12 caracteres."})
             salt = secrets.token_bytes(16)
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 if db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]:
                     return self.json_response(409, {"error": "O administrador inicial já foi criado."})
-                user_id = str(uuid4())
-                db.execute("INSERT INTO users VALUES (?,?,?,?,?,?,1,?)",
-                           (user_id, username, name, "admin", salt, password_hash(password, salt), datetime.now(timezone.utc).isoformat()))
-            return self.login_user(user_id, username, name, "admin")
+                organization_id, user_id, membership_id = str(uuid4()), str(uuid4()), str(uuid4())
+                now=datetime.now(timezone.utc)
+                slug=slugify(company_name)
+                if db.execute("SELECT 1 FROM organizations WHERE slug=?", (slug,)).fetchone():
+                    slug=f"{slug}-{secrets.token_hex(2)}"
+                db.execute("INSERT INTO organizations(id,name,slug,plan,status,created_at) VALUES (?,?,?,?,?,?)",
+                           (organization_id,company_name,slug,"starter","active",now.isoformat()))
+                db.execute("INSERT INTO users VALUES (?,?,?,1)", (user_id,name,now.isoformat()))
+                db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
+                           (membership_id,organization_id,user_id,username,"admin",salt,password_hash(password,salt),1,now.isoformat()))
+                org={"id":organization_id,"name":company_name,"slug":slug,"plan":"starter","status":"active","trial_ends_at":None}
+                self.log_audit(db,{"organization_id":organization_id,"id":membership_id,"name":name},"create","organization",organization_id,"Empresa criada")
+            return self.login_user(membership_id,user_id,organization_id,username,name,"admin",True,org)
 
         if path == "/api/login":
             username = str(data.get("username", "")).strip().lower()
             password = str(data.get("password", ""))
             with connect() as db:
-                row = db.execute("SELECT id,username,name,role,salt,password_hash,active FROM users WHERE username=?", (username,)).fetchone()
-            if not row or not row[6] or not hmac.compare_digest(password_hash(password, row[4]), row[5]):
+                company_slug=str(data.get("company", "")).strip().lower()
+                query="""SELECT m.id AS membership_id,u.id AS user_id,m.organization_id,m.username,u.name,m.role,
+                    m.salt,m.password_hash,m.active,u.is_platform_admin,o.name AS organization_name,
+                    o.slug AS organization_slug,o.document AS organization_document,o.plan AS organization_plan,
+                    o.status AS organization_status,o.trial_ends_at FROM memberships m JOIN users u ON u.id=m.user_id
+                    JOIN organizations o ON o.id=m.organization_id WHERE m.username=? AND m.active=1
+                    AND ((o.status IN ('active','trial') AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?))
+                         OR u.is_platform_admin=1)"""
+                params=[username,datetime.now(timezone.utc).isoformat()]
+                if company_slug:
+                    query+=" AND o.slug=?"
+                    params.append(company_slug)
+                rows=db.execute(query,params).fetchall()
+            if not rows:
                 return self.json_response(401, {"error": "Usuário ou senha incorretos."})
-            return self.login_user(row[0], row[1], row[2], row[3])
+            if len(rows)>1:
+                return self.json_response(400,{"error":"Informe o código da empresa para identificar seu acesso."})
+            row=rows[0]
+            if not hmac.compare_digest(password_hash(password,row["salt"]),row["password_hash"]):
+                return self.json_response(401,{"error":"Usuário ou senha incorretos."})
+            org={"id":row["organization_id"],"name":row["organization_name"],"slug":row["organization_slug"],
+                 "document":row["organization_document"],"plan":row["organization_plan"],"status":row["organization_status"],"trial_ends_at":row["trial_ends_at"]}
+            return self.login_user(row["membership_id"],row["user_id"],row["organization_id"],row["username"],row["name"],row["role"],bool(row["is_platform_admin"]),org)
 
         if path == "/api/logout":
             user = self.require_user()
@@ -193,106 +416,180 @@ class Handler(SimpleHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if path == "/api/users":
-            if user["role"] != "admin":
-                return self.json_response(403, {"error": "Somente administradores podem gerenciar acessos."})
-            username, name = str(data.get("username", "")).strip().lower(), str(data.get("name", "")).strip()
-            password, role = str(data.get("password", "")), str(data.get("role", ""))
-            if not username or not name or len(password) < 12 or role not in ROLES:
-                return self.json_response(400, {"error": "Informe usuário, nome, perfil válido e senha com pelo menos 12 caracteres."})
-            salt, user_id = secrets.token_bytes(16), str(uuid4())
-            try:
-                with connect() as db:
-                    db.execute("INSERT INTO users VALUES (?,?,?,?,?,?,1,?)",
-                               (user_id, username, name, role, salt, password_hash(password, salt), datetime.now(timezone.utc).isoformat()))
-            except sqlite3.IntegrityError:
-                return self.json_response(409, {"error": "Esse nome de usuário já está cadastrado."})
-            return self.json_response(201, {"id": user_id, "username": username, "name": name, "role": role, "active": True})
-
-        if path == "/api/users/reset-password":
-            if user["role"] != "admin":
-                return self.json_response(403, {"error": "Somente administradores podem redefinir senhas."})
-            target_id = str(data.get("user_id", ""))
-            password = str(data.get("password", ""))
-            if not target_id or len(password) < 12 or len(password) > 1024:
-                return self.json_response(400, {"error": "Informe uma nova senha com pelo menos 12 caracteres."})
-            salt = secrets.token_bytes(16)
-            cookie = SimpleCookie()
-            cookie.load(self.headers.get("Cookie", ""))
-            current_token = cookie[COOKIE].value if COOKIE in cookie else ""
-            current_digest = hashlib.sha256(current_token.encode()).hexdigest()
-            with connect() as db:
-                changed = db.execute("UPDATE users SET salt=?,password_hash=? WHERE id=?",
-                                     (salt, password_hash(password, salt), target_id)).rowcount
-                if not changed:
-                    return self.json_response(404, {"error": "Conta não encontrada."})
-                db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (target_id, current_digest))
-            return self.json_response(200, {"ok": True, "message": "Senha redefinida. A pessoa precisará entrar novamente."})
-
-        if path == "/api/users/update":
-            if user["role"] != "admin":
-                return self.json_response(403, {"error": "Somente administradores podem editar contas."})
-            target_id = str(data.get("user_id", ""))
-            username = str(data.get("username", "")).strip().lower()
-            name = str(data.get("name", "")).strip()
-            new_role = str(data.get("role", ""))
-            password = str(data.get("password", ""))
-            active = data.get("active")
-            if (not target_id or not username or len(username) > 80 or not name or len(name) > 150
-                    or new_role not in ROLES or not isinstance(active, bool)):
-                return self.json_response(400, {"error": "Informe nome, usuário, perfil e situação válidos."})
-            if password and not 12 <= len(password) <= 1024:
-                return self.json_response(400, {"error": "A nova senha deve ter entre 12 e 1024 caracteres."})
-            cookie = SimpleCookie()
-            cookie.load(self.headers.get("Cookie", ""))
-            current_token = cookie[COOKIE].value if COOKIE in cookie else ""
-            current_digest = hashlib.sha256(current_token.encode()).hexdigest()
+        if path == "/api/platform/companies":
+            if not user["is_platform_admin"]:
+                return self.json_response(403,{"error":"Somente a administração da plataforma pode cadastrar empresas."})
+            name=str(data.get("name","")).strip()
+            slug=slugify(data.get("slug") or name)
+            document=str(data.get("document","")).strip()[:40]
+            plan=str(data.get("plan","starter"))
+            admin_name=str(data.get("admin_name","")).strip()
+            admin_username=str(data.get("admin_username","")).strip().lower()
+            admin_password=str(data.get("admin_password",""))
+            if not name or len(name)>180 or not admin_name or len(admin_name)>150 or not admin_username or len(admin_username)>80 or not 12<=len(admin_password)<=1024 or plan not in PLAN_LIMITS:
+                return self.json_response(400,{"error":"Informe empresa, plano e os dados do primeiro administrador; a senha precisa ter 12 caracteres ou mais."})
+            now=datetime.now(timezone.utc)
+            org_id,user_id,membership_id=str(uuid4()),str(uuid4()),str(uuid4())
+            salt=secrets.token_bytes(16)
             try:
                 with connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    current = db.execute("SELECT id,username,name,role,active FROM users WHERE id=?", (target_id,)).fetchone()
-                    if not current:
-                        return self.json_response(404, {"error": "Conta não encontrada."})
-                    is_self = target_id == user["id"]
-                    if is_self and (new_role != current["role"] or active != bool(current["active"])):
-                        return self.json_response(400, {"error": "Para mudar seu próprio perfil ou situação, outro administrador precisa fazer a alteração."})
-                    if current["role"] == "admin" and current["active"] and (new_role != "admin" or not active):
-                        remaining = db.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (target_id,)).fetchone()[0]
-                        if remaining == 0:
-                            return self.json_response(400, {"error": "Mantenha pelo menos um administrador ativo no sistema."})
-                    if password:
-                        salt = secrets.token_bytes(16)
-                        db.execute("UPDATE users SET username=?,name=?,role=?,active=?,salt=?,password_hash=? WHERE id=?",
-                                   (username, name, new_role, int(active), salt, password_hash(password, salt), target_id))
-                    else:
-                        db.execute("UPDATE users SET username=?,name=?,role=?,active=? WHERE id=?",
-                                   (username, name, new_role, int(active), target_id))
-                    db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (target_id, current_digest))
-                    saved = {"id": target_id, "username": username, "name": name, "role": new_role, "active": active}
+                    db.execute("INSERT INTO organizations(id,name,slug,document,plan,status,trial_ends_at,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                               (org_id,name,slug,document,plan,"trial",(now+timedelta(days=14)).isoformat(),now.isoformat()))
+                    db.execute("INSERT INTO users VALUES (?,?,?,0)",(user_id,admin_name,now.isoformat()))
+                    db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
+                               (membership_id,org_id,user_id,admin_username,"admin",salt,password_hash(admin_password,salt),1,now.isoformat()))
+                    self.log_audit(db,{"organization_id":org_id,"id":user["id"],"name":user["name"]},"create","organization",org_id,"Empresa e administrador inicial cadastrados")
             except sqlite3.IntegrityError:
-                return self.json_response(409, {"error": "Esse nome de usuário já está cadastrado."})
-            return self.json_response(200, {"user": saved, "message": "Conta atualizada. As sessões anteriores foram encerradas."})
+                return self.json_response(409,{"error":"O código da empresa ou nome de usuário já existe nessa empresa."})
+            return self.json_response(201,{"company":{"id":org_id,"name":name,"slug":slug,"document":document,"plan":plan,"status":"trial","trial_ends_at":(now+timedelta(days=14)).isoformat()},"admin":{"username":admin_username,"name":admin_name}})
 
-        if path == "/api/users/delete":
-            if user["role"] != "admin":
-                return self.json_response(403, {"error": "Somente administradores podem excluir contas."})
-            target_id = str(data.get("user_id", ""))
-            if not target_id:
-                return self.json_response(400, {"error": "Selecione uma conta para excluir."})
-            if target_id == user["id"]:
-                return self.json_response(400, {"error": "Você não pode excluir a própria conta."})
+        if path == "/api/platform/companies/update":
+            if not user["is_platform_admin"]:
+                return self.json_response(403,{"error":"Somente a administração da plataforma pode alterar empresas."})
+            org_id=str(data.get("id",""))
+            plan=str(data.get("plan",""))
+            status=str(data.get("status",""))
+            if plan not in PLAN_LIMITS or status not in {"trial","active","suspended"}:
+                return self.json_response(400,{"error":"Plano ou situação inválidos."})
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                target = db.execute("SELECT role,active FROM users WHERE id=?", (target_id,)).fetchone()
+                target=db.execute("SELECT id,name,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
                 if not target:
-                    return self.json_response(404, {"error": "Conta não encontrada."})
-                if target["role"] == "admin" and target["active"]:
-                    remaining = db.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (target_id,)).fetchone()[0]
-                    if remaining == 0:
-                        return self.json_response(400, {"error": "Não é possível excluir o último administrador ativo."})
-                db.execute("DELETE FROM sessions WHERE user_id=?", (target_id,))
-                db.execute("DELETE FROM users WHERE id=?", (target_id,))
-            return self.json_response(200, {"ok": True})
+                    return self.json_response(404,{"error":"Empresa não encontrada."})
+                users_count=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=?",(org_id,)).fetchone()[0]
+                if users_count>PLAN_LIMITS[plan]:
+                    return self.json_response(400,{"error":f"Esse plano permite até {PLAN_LIMITS[plan]} acessos; a empresa já tem {users_count}."})
+                db.execute("UPDATE organizations SET plan=?,status=? WHERE id=?",(plan,status,org_id))
+                self.log_audit(db,{"organization_id":org_id,"id":user["id"],"name":user["name"]},"update","organization",org_id,f"Plano {target['plan']} → {plan}; situação {target['status']} → {status}")
+            return self.json_response(200,{"ok":True})
+
+        if path == "/api/organization/update":
+            if user["role"]!="admin":
+                return self.json_response(403,{"error":"Somente o administrador da empresa pode alterar seus dados."})
+            name=str(data.get("name","")).strip()
+            document=str(data.get("document","")).strip()[:40]
+            if not name or len(name)>180:
+                return self.json_response(400,{"error":"Informe o nome da empresa."})
+            with connect() as db:
+                db.execute("UPDATE organizations SET name=?,document=? WHERE id=?",(name,document,user["organization_id"]))
+                self.log_audit(db,user,"update","organization",user["organization_id"],"Dados cadastrais da empresa atualizados")
+            return self.json_response(200,{"organization":{"id":user["organization_id"],"name":name,"slug":user["organization_slug"],"document":document}})
+
+        if path == "/api/users":
+            if user["role"] != "admin":
+                return self.json_response(403, {"error": "Somente administradores da empresa podem gerenciar acessos."})
+            username,name=str(data.get("username","")).strip().lower(),str(data.get("name","")).strip()
+            password,role=str(data.get("password","")),str(data.get("role",""))
+            if not username or len(username)>80 or not name or len(name)>150 or not 12<=len(password)<=1024 or role not in ROLES:
+                return self.json_response(400,{"error":"Informe usuário, nome, perfil válido e senha com pelo menos 12 caracteres."})
+            salt,user_id,membership_id=secrets.token_bytes(16),str(uuid4()),str(uuid4())
+            now=datetime.now(timezone.utc).isoformat()
+            try:
+                with connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    org=db.execute("SELECT plan,status FROM organizations WHERE id=?",(user["organization_id"],)).fetchone()
+                    count=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=?",(user["organization_id"],)).fetchone()[0]
+                    if count>=PLAN_LIMITS.get(org["plan"],PLAN_LIMITS["starter"]):
+                        return self.json_response(400,{"error":"O limite de acessos deste plano foi atingido."})
+                    db.execute("INSERT INTO users VALUES (?,?,?,0)",(user_id,name,now))
+                    db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
+                               (membership_id,user["organization_id"],user_id,username,role,salt,password_hash(password,salt),1,now))
+                    self.log_audit(db,user,"create","user",membership_id,f"Acesso criado para {name} ({role})")
+            except sqlite3.IntegrityError:
+                return self.json_response(409,{"error":"Esse nome de usuário já está cadastrado nesta empresa."})
+            return self.json_response(201,{"id":membership_id,"username":username,"name":name,"role":role,"active":True})
+
+        if path in {"/api/users/reset-password","/api/users/update"}:
+            if user["role"]!="admin":
+                return self.json_response(403,{"error":"Somente administradores da empresa podem editar contas."})
+            target_id=str(data.get("user_id",""))
+            current_password_reset=path=="/api/users/reset-password"
+            if current_password_reset:
+                username=name=new_role=None
+                password=str(data.get("password",""))
+                active=None
+                if not target_id or not 12<=len(password)<=1024:
+                    return self.json_response(400,{"error":"Informe uma nova senha com pelo menos 12 caracteres."})
+            else:
+                username=str(data.get("username","")).strip().lower()
+                name=str(data.get("name","")).strip()
+                new_role=str(data.get("role",""))
+                password=str(data.get("password",""))
+                active=data.get("active")
+                if not target_id or not username or len(username)>80 or not name or len(name)>150 or new_role not in ROLES or not isinstance(active,bool):
+                    return self.json_response(400,{"error":"Informe nome, usuário, perfil e situação válidos."})
+                if password and not 12<=len(password)<=1024:
+                    return self.json_response(400,{"error":"A nova senha deve ter entre 12 e 1024 caracteres."})
+            cookie=SimpleCookie()
+            cookie.load(self.headers.get("Cookie",""))
+            current_token=cookie[COOKIE].value if COOKIE in cookie else ""
+            current_digest=hashlib.sha256(current_token.encode()).hexdigest()
+            try:
+                with connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    query="""SELECT m.id,m.user_id,m.username,m.role,m.active,u.name,u.is_platform_admin FROM memberships m JOIN users u ON u.id=m.user_id
+                        WHERE m.id=? AND m.organization_id=?"""
+                    current=db.execute(query,(target_id,user["organization_id"])).fetchone()
+                    if not current:
+                        return self.json_response(404,{"error":"Conta não encontrada nesta empresa."})
+                    is_self=target_id==user["id"]
+                    if current["is_platform_admin"] and not user["is_platform_admin"]:
+                        return self.json_response(403,{"error":"A conta de administração da plataforma só pode ser gerenciada pela própria plataforma."})
+                    if current_password_reset:
+                        salt=secrets.token_bytes(16)
+                        db.execute("UPDATE memberships SET salt=?,password_hash=? WHERE id=?",(salt,password_hash(password,salt),target_id))
+                        saved={"id":target_id,"username":current["username"],"name":current["name"],"role":current["role"],"active":bool(current["active"])}
+                    else:
+                        if is_self and (new_role!=current["role"] or active!=bool(current["active"])):
+                            return self.json_response(400,{"error":"Para mudar seu próprio perfil ou situação, outro administrador precisa fazer a alteração."})
+                        if current["role"]=="admin" and current["active"] and (new_role!="admin" or not active):
+                            remaining=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=? AND role='admin' AND active=1 AND id<>?",
+                                                 (user["organization_id"],target_id)).fetchone()[0]
+                            if remaining==0:
+                                return self.json_response(400,{"error":"Mantenha pelo menos um administrador ativo nesta empresa."})
+                        if password:
+                            salt=secrets.token_bytes(16)
+                            db.execute("UPDATE memberships SET username=?,role=?,active=?,salt=?,password_hash=? WHERE id=?",
+                                       (username,new_role,int(active),salt,password_hash(password,salt),target_id))
+                        else:
+                            db.execute("UPDATE memberships SET username=?,role=?,active=? WHERE id=?",
+                                       (username,new_role,int(active),target_id))
+                        db.execute("UPDATE users SET name=? WHERE id=?",(name,current["user_id"]))
+                        saved={"id":target_id,"username":username,"name":name,"role":new_role,"active":active}
+                    db.execute("DELETE FROM sessions WHERE membership_id=? AND token_hash<>?",(target_id,current_digest))
+                    self.log_audit(db,user,"update","user",target_id,f"Acesso atualizado para {saved['name']}")
+            except sqlite3.IntegrityError:
+                return self.json_response(409,{"error":"Esse nome de usuário já está cadastrado nesta empresa."})
+            return self.json_response(200,{"user":saved,"message":"Conta atualizada. As outras sessões foram encerradas."})
+
+        if path == "/api/users/delete":
+            if user["role"]!="admin":
+                return self.json_response(403,{"error":"Somente administradores da empresa podem excluir contas."})
+            target_id=str(data.get("user_id",""))
+            if not target_id:
+                return self.json_response(400,{"error":"Selecione uma conta para excluir."})
+            if target_id==user["id"]:
+                return self.json_response(400,{"error":"Você não pode excluir a própria conta."})
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                target=db.execute("""SELECT m.user_id,m.role,m.active,u.name,u.is_platform_admin FROM memberships m JOIN users u ON u.id=m.user_id
+                    WHERE m.id=? AND m.organization_id=?""",(target_id,user["organization_id"])).fetchone()
+                if not target:
+                    return self.json_response(404,{"error":"Conta não encontrada nesta empresa."})
+                if target["is_platform_admin"]:
+                    return self.json_response(403,{"error":"A conta de administração da plataforma não pode ser excluída por um administrador de empresa."})
+                if target["role"]=="admin" and target["active"]:
+                    remaining=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=? AND role='admin' AND active=1 AND id<>?",
+                                         (user["organization_id"],target_id)).fetchone()[0]
+                    if remaining==0:
+                        return self.json_response(400,{"error":"Não é possível excluir o último administrador ativo desta empresa."})
+                db.execute("DELETE FROM sessions WHERE membership_id=?",(target_id,))
+                db.execute("DELETE FROM memberships WHERE id=?",(target_id,))
+                db.execute("DELETE FROM users WHERE id=? AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id=?)",
+                           (target["user_id"],target["user_id"]))
+                self.log_audit(db,user,"delete","user",target_id,f"Acesso removido para {target['name']}; dados operacionais mantidos")
+            return self.json_response(200,{"ok":True})
 
         if not path.startswith("/api/"):
             return self.json_response(404, {"error": "Endereço não encontrado."})
@@ -312,7 +609,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json_response(403, {"error": "Somente administradores e almoxarifado podem cadastrar ou ajustar o estoque."})
         if kind == "inventoryItems":
             try:
-                saved = self.save_inventory_item(data)
+                saved = self.save_inventory_item(data,user)
                 return self.json_response(200, saved)
             except (ValueError, TypeError, OverflowError) as error:
                 return self.json_response(400, {"error": str(error)})
@@ -347,7 +644,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not data.get("id"):
                     return self.json_response(403, {"error": "Ordens novas precisam ser atribuídas pela supervisão."})
                 with connect() as db:
-                    row = db.execute("SELECT data FROM records WHERE kind='orders' AND id=?", (data["id"],)).fetchone()
+                    row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='orders' AND id=?", (user["organization_id"],data["id"])).fetchone()
                 if not row:
                     return self.json_response(404, {"error": "Ordem de serviço não encontrada."})
                 saved = json.loads(row[0])
@@ -364,7 +661,9 @@ class Handler(SimpleHTTPRequestHandler):
             elif kind == "orders":
                 technician_id = str(data.get("technician_id", ""))
                 with connect() as db:
-                    technician = db.execute("SELECT id,name FROM users WHERE id=? AND role='technician' AND active=1", (technician_id,)).fetchone()
+                    technician = db.execute("""SELECT m.id,u.name FROM memberships m JOIN users u ON u.id=m.user_id
+                        WHERE m.id=? AND m.organization_id=? AND m.role='technician' AND m.active=1""",
+                        (technician_id,user["organization_id"])).fetchone()
                 if not technician:
                     return self.json_response(400, {"error": "Atribua a ordem a uma conta ativa de técnico."})
                 data["technician_id"] = technician["id"]
@@ -373,8 +672,8 @@ class Handler(SimpleHTTPRequestHandler):
             if kind == "maintenance" and role == "technician":
                 asset_id = str(data.get("asset_id", ""))
                 with connect() as db:
-                    rows = db.execute("SELECT data FROM records WHERE kind='orders'").fetchall()
-                    asset_row = db.execute("SELECT data FROM records WHERE kind='assets' AND id=?", (asset_id,)).fetchone()
+                    rows = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='orders'", (user["organization_id"],)).fetchall()
+                    asset_row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='assets' AND id=?", (user["organization_id"],asset_id)).fetchone()
                 assigned = any((o := json.loads(row[0])).get("technician_id") == user["id"] and o.get("asset_id") == asset_id for row in rows)
                 if not asset_id or not asset_row or not assigned:
                     return self.json_response(403, {"error": "A manutenção só pode ser registrada em equipamentos das suas ordens atribuídas."})
@@ -400,7 +699,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if data.get("status") not in {"approved", "ordered", "received", "rejected"}:
                         return self.json_response(400, {"error": "Situação de compra inválida."})
                     with connect() as db:
-                        current = db.execute("SELECT data FROM records WHERE kind='purchaseRequests' AND id=?", (data["id"],)).fetchone()
+                        current = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='purchaseRequests' AND id=?", (user["organization_id"],data["id"])).fetchone()
                     if not current:
                         return self.json_response(404, {"error": "Solicitação de compra não encontrada."})
                     saved = json.loads(current[0])
@@ -410,9 +709,9 @@ class Handler(SimpleHTTPRequestHandler):
             if kind in {"assets", "orders", "maintenance"}:
                 client_id = str(data.get("client_id", ""))
                 with connect() as db:
-                    client = db.execute("SELECT 1 FROM records WHERE kind='clients' AND id=?", (client_id,)).fetchone()
+                    client = db.execute("SELECT 1 FROM records WHERE organization_id=? AND kind='clients' AND id=?", (user["organization_id"],client_id)).fetchone()
                     asset_id = str(data.get("asset_id", ""))
-                    asset_row = db.execute("SELECT data FROM records WHERE kind='assets' AND id=?", (asset_id,)).fetchone() if asset_id else None
+                    asset_row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='assets' AND id=?", (user["organization_id"],asset_id)).fetchone() if asset_id else None
                 if not client:
                     return self.json_response(400, {"error": "O cliente selecionado não existe."})
                 if kind == "orders" and asset_id and (not asset_row or json.loads(asset_row[0]).get("client_id") != client_id):
@@ -423,7 +722,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if data.get("status") not in {"ordered", "received"}:
                     return self.json_response(403, {"error": "O almoxarifado pode atualizar pedidos aprovados para realizado ou recebido."})
                 with connect() as db:
-                    current = db.execute("SELECT data FROM records WHERE kind='purchaseRequests' AND id=?", (data["id"],)).fetchone()
+                    current = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='purchaseRequests' AND id=?", (user["organization_id"],data["id"])).fetchone()
                 if not current:
                     return self.json_response(404, {"error": "Solicitação de compra não encontrada."})
                 saved = json.loads(current[0])
@@ -437,7 +736,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not data.get("id") or data.get("status") not in {"approved", "separated", "delivered", "rejected"}:
                     return self.json_response(403, {"error": "O almoxarifado só pode atualizar o andamento de uma solicitação existente."})
                 with connect() as db:
-                    current = db.execute("SELECT data FROM records WHERE kind='stockRequests' AND id=?", (data["id"],)).fetchone()
+                    current = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='stockRequests' AND id=?", (user["organization_id"],data["id"])).fetchone()
                 if not current:
                     return self.json_response(404, {"error": "Solicitação não encontrada."})
                 saved = json.loads(current[0])
@@ -448,134 +747,146 @@ class Handler(SimpleHTTPRequestHandler):
             data["id"] = str(data.get("id") or uuid4())
             data.setdefault("created_at", datetime.now(timezone.utc).isoformat())
             with connect() as db:
-                db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)",
-                           (kind, data["id"], json.dumps(data, ensure_ascii=False, allow_nan=False)))
+                existing=db.execute("SELECT 1 FROM records WHERE organization_id=? AND kind=? AND id=?",
+                                    (user["organization_id"],kind,data["id"])).fetchone()
+                db.execute("INSERT OR REPLACE INTO records(organization_id,kind,id,data) VALUES (?,?,?,?)",
+                           (user["organization_id"],kind,data["id"],json.dumps(data,ensure_ascii=False,allow_nan=False)))
                 if kind == "maintenance" and data.get("asset_id"):
-                    row = db.execute("SELECT data FROM records WHERE kind='assets' AND id=?", (data["asset_id"],)).fetchone()
+                    row = db.execute("SELECT data FROM records WHERE organization_id=? AND kind='assets' AND id=?", (user["organization_id"],data["asset_id"])).fetchone()
                     if row:
                         asset = json.loads(row[0])
                         asset["last_service"] = data.get("performed") or data.get("due")
                         asset["next_service"] = data.get("due")
-                        db.execute("UPDATE records SET data=? WHERE kind='assets' AND id=?",
-                                   (json.dumps(asset, ensure_ascii=False), asset["id"]))
+                        db.execute("UPDATE records SET data=? WHERE organization_id=? AND kind='assets' AND id=?",
+                                   (json.dumps(asset,ensure_ascii=False),user["organization_id"],asset["id"]))
+                self.log_audit(db,user,"update" if existing else "create",kind,data["id"],f"Registro {kind} salvo")
             return self.json_response(200, data)
         except (ValueError, TypeError, AttributeError, OverflowError) as error:
             return self.json_response(400, {"error": str(error) or "Dados inválidos."})
         except sqlite3.Error:
             return self.json_response(500, {"error": "Não foi possível salvar no banco de dados."})
 
-    def login_user(self, user_id, username, name, role):
-        token = secrets.token_urlsafe(32)
-        digest = hashlib.sha256(token.encode()).hexdigest()
-        expires = datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)
+    def login_user(self,membership_id,user_id,organization_id,username,name,role,is_platform_admin,organization):
+        token=secrets.token_urlsafe(32)
+        digest=hashlib.sha256(token.encode()).hexdigest()
+        expires=datetime.now(timezone.utc)+timedelta(hours=SESSION_HOURS)
         with connect() as db:
-            db.execute("INSERT INTO sessions VALUES (?,?,?)", (digest, user_id, expires.isoformat()))
-        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-        cookie = f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS * 3600}{secure}"
-        return self.json_response(200, {"user": {"id": user_id, "username": username, "name": name, "role": role}}, (("Set-Cookie", cookie),))
+            db.execute("INSERT INTO sessions VALUES (?,?,?)",(digest,membership_id,expires.isoformat()))
+        secure="; Secure" if self.headers.get("X-Forwarded-Proto")=="https" else ""
+        cookie=f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS*3600}{secure}"
+        session_user={"id":membership_id,"account_id":user_id,"username":username,"name":name,"role":role,
+                      "is_platform_admin":bool(is_platform_admin),"organization_id":organization_id,
+                      "organization_name":organization.get("name"),"organization_slug":organization.get("slug"),
+                      "organization_plan":organization.get("plan"),"organization_status":organization.get("status")}
+        return self.json_response(200,{"user":session_user},(("Set-Cookie",cookie),))
 
     @staticmethod
-    def reserved_quantity(db, inventory_id):
-        reserved = 0.0
-        rows = db.execute("SELECT data FROM records WHERE kind='stockRequests'").fetchall()
+    def log_audit(db,user,action,kind,record_id,summary):
+        db.execute("INSERT INTO audit_logs VALUES (?,?,?,?,?,?,?,?,?)",
+                   (str(uuid4()),user["organization_id"],user.get("id"),str(user.get("name","")),
+                    action,kind,str(record_id) if record_id is not None else None,str(summary)[:500],
+                    datetime.now(timezone.utc).isoformat()))
+
+    @staticmethod
+    def reserved_quantity(db,organization_id,inventory_id):
+        reserved=0.0
+        rows=db.execute("SELECT data FROM records WHERE organization_id=? AND kind='stockRequests'",(organization_id,)).fetchall()
         for row in rows:
-            request = json.loads(row[0])
-            if request.get("status") in {"pending", "approved", "separated"}:
-                reserved += sum(float(item.get("quantity", 0)) for item in request.get("items", [])
-                                if item.get("item_id") == inventory_id)
+            request=json.loads(row[0])
+            if request.get("status") in {"pending","approved","separated"}:
+                reserved+=sum(float(item.get("quantity",0)) for item in request.get("items",[]) if item.get("item_id")==inventory_id)
         return reserved
 
-    def save_inventory_item(self, item):
-        self.validate_record("inventoryItems", item)
+    def save_inventory_item(self,item,user):
+        self.validate_record("inventoryItems",item)
+        organization_id=user["organization_id"]
         with connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            saved = dict(item)
-            saved["id"] = str(saved.get("id") or uuid4())
-            reserved = self.reserved_quantity(db, saved["id"])
-            if float(saved.get("quantity", 0)) < reserved:
+            saved=dict(item)
+            saved["id"]=str(saved.get("id") or uuid4())
+            existing=db.execute("SELECT 1 FROM records WHERE organization_id=? AND kind='inventoryItems' AND id=?",
+                                (organization_id,saved["id"])).fetchone()
+            reserved=self.reserved_quantity(db,organization_id,saved["id"])
+            if float(saved.get("quantity",0))<reserved:
                 raise ValueError(f"Há {reserved:g} unidade(s) reservada(s) em solicitações ainda não entregues.")
-            saved.setdefault("created_at", datetime.now(timezone.utc).isoformat())
-            db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)",
-                       ("inventoryItems", saved["id"], json.dumps(saved, ensure_ascii=False, allow_nan=False)))
+            saved.setdefault("created_at",datetime.now(timezone.utc).isoformat())
+            db.execute("INSERT OR REPLACE INTO records(organization_id,kind,id,data) VALUES (?,?,?,?)",
+                       (organization_id,"inventoryItems",saved["id"],json.dumps(saved,ensure_ascii=False,allow_nan=False)))
+            self.log_audit(db,user,"update" if existing else "create","inventoryItems",saved["id"],f"Estoque de {saved['name']} atualizado")
             return saved
 
-    def create_stock_request(self, request, user):
-        raw_items = request.get("items")
-        if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 20:
+    def create_stock_request(self,request,user):
+        raw_items=request.get("items")
+        if not isinstance(raw_items,list) or not raw_items or len(raw_items)>20:
             raise ValueError("Selecione de 1 a 20 materiais cadastrados no almoxarifado.")
-        quantities = {}
+        quantities={}
         for item in raw_items:
-            if not isinstance(item, dict):
+            if not isinstance(item,dict):
                 raise ValueError("Seleção de material inválida.")
-            item_id = str(item.get("item_id", ""))
-            quantity = float(item.get("quantity", 0))
-            if not item_id or not 0 < quantity <= 1_000_000:
+            item_id=str(item.get("item_id",""))
+            quantity=float(item.get("quantity",0))
+            if not item_id or not 0<quantity<=1_000_000:
                 raise ValueError("Informe materiais cadastrados e uma quantidade válida.")
-            quantities[item_id] = quantities.get(item_id, 0) + quantity
-
+            quantities[item_id]=quantities.get(item_id,0)+quantity
         with connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            selected = []
-            for item_id, quantity in quantities.items():
-                row = db.execute("SELECT data FROM records WHERE kind='inventoryItems' AND id=?", (item_id,)).fetchone()
+            selected=[]
+            for item_id,quantity in quantities.items():
+                row=db.execute("SELECT data FROM records WHERE organization_id=? AND kind='inventoryItems' AND id=?",
+                               (user["organization_id"],item_id)).fetchone()
                 if not row:
-                    raise ValueError("Um dos materiais selecionados não existe mais no almoxarifado.")
-                inventory = json.loads(row[0])
-                reserved = self.reserved_quantity(db, item_id)
-                available = float(inventory.get("quantity", 0)) - reserved
-                if quantity > available:
-                    raise ValueError(f"Estoque disponível insuficiente para {inventory['name']}: restam {max(0, available):g} {inventory.get('unit', 'un')}.")
-                selected.append({"item_id": item_id, "name": inventory["name"],
-                                 "unit": inventory.get("unit", "un"), "quantity": quantity})
-            total = sum(item["quantity"] for item in selected)
-            data = {
-                "id": str(uuid4()), "items": selected,
-                "item": f"Solicitação com {len(selected)} {('item' if len(selected) == 1 else 'itens')}",
-                "quantity": total, "priority": str(request.get("priority", "Normal")),
-                "needed_for": str(request.get("needed_for", ""))[:180],
-                "notes": str(request.get("notes", ""))[:3000], "status": "pending",
-                "requester_id": user["id"], "requester": user["name"],
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self.validate_record("stockRequests", data)
-            db.execute("INSERT INTO records VALUES (?,?,?)",
-                       ("stockRequests", data["id"], json.dumps(data, ensure_ascii=False, allow_nan=False)))
-            return data
+                    raise ValueError("Um dos materiais selecionados não existe mais no estoque desta empresa.")
+                inventory=json.loads(row[0])
+                reserved=self.reserved_quantity(db,user["organization_id"],item_id)
+                available=float(inventory.get("quantity",0))-reserved
+                if quantity>available:
+                    raise ValueError(f"Estoque disponível insuficiente para {inventory['name']}: restam {max(0,available):g} {inventory.get('unit','un')}.")
+                selected.append({"item_id":item_id,"name":inventory["name"],"unit":inventory.get("unit","un"),"quantity":quantity})
+            total=sum(item["quantity"] for item in selected)
+            saved={"id":str(uuid4()),"items":selected,"item":f"Solicitação com {len(selected)} {('item' if len(selected)==1 else 'itens')}",
+                   "quantity":total,"priority":str(request.get("priority","Normal")),"needed_for":str(request.get("needed_for",""))[:180],
+                   "notes":str(request.get("notes",""))[:3000],"status":"pending","requester_id":user["id"],
+                   "requester":user["name"],"created_at":datetime.now(timezone.utc).isoformat()}
+            self.validate_record("stockRequests",saved)
+            db.execute("INSERT INTO records(organization_id,kind,id,data) VALUES (?,?,?,?)",
+                       (user["organization_id"],"stockRequests",saved["id"],json.dumps(saved,ensure_ascii=False,allow_nan=False)))
+            self.log_audit(db,user,"create","stockRequests",saved["id"],"Solicitação criada e saldo reservado")
+            return saved
 
-    def update_stock_request(self, request_id, status, user):
-        valid = {"approved", "separated", "delivered", "rejected"}
+    def update_stock_request(self,request_id,status,user):
+        valid={"approved","separated","delivered","rejected"}
         if status not in valid:
             raise ValueError("Situação do pedido inválida.")
+        organization_id=user["organization_id"]
         with connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT data FROM records WHERE kind='stockRequests' AND id=?", (request_id,)).fetchone()
+            row=db.execute("SELECT data FROM records WHERE organization_id=? AND kind='stockRequests' AND id=?",
+                           (organization_id,request_id)).fetchone()
             if not row:
-                raise LookupError("Solicitação não encontrada.")
-            saved = json.loads(row[0])
+                raise LookupError("Solicitação não encontrada nesta empresa.")
+            saved=json.loads(row[0])
             if saved.get("items"):
-                transitions = {"pending": {"approved", "rejected"},
-                               "approved": {"separated", "rejected"},
-                               "separated": {"delivered", "rejected"}}
-                if status not in transitions.get(saved.get("status"), set()):
+                transitions={"pending":{"approved","rejected"},"approved":{"separated","rejected"},"separated":{"delivered","rejected"}}
+                if status not in transitions.get(saved.get("status"),set()):
                     raise PermissionError("Siga o fluxo: aprovar, separar e depois entregar; também é possível recusar antes da entrega.")
-                if status == "delivered":
+                if status=="delivered":
                     for item in saved["items"]:
-                        item_row = db.execute("SELECT data FROM records WHERE kind='inventoryItems' AND id=?", (item["item_id"],)).fetchone()
+                        item_row=db.execute("SELECT data FROM records WHERE organization_id=? AND kind='inventoryItems' AND id=?",
+                                            (organization_id,item["item_id"])).fetchone()
                         if not item_row:
                             raise ValueError(f"O material {item['name']} não existe mais no estoque.")
-                        inventory = json.loads(item_row[0])
-                        quantity = float(inventory.get("quantity", 0)) - float(item["quantity"])
+                        inventory=json.loads(item_row[0])
+                        quantity=float(inventory.get("quantity",0))-float(item["quantity"])
                         if quantity < -1e-9:
                             raise ValueError(f"Estoque físico insuficiente para entregar {item['name']}.")
-                        inventory["quantity"] = max(0, quantity)
-                        db.execute("UPDATE records SET data=? WHERE kind='inventoryItems' AND id=?",
-                                   (json.dumps(inventory, ensure_ascii=False), inventory["id"]))
-            elif user["role"] == "warehouse" and status not in {"approved", "separated", "delivered", "rejected"}:
-                raise PermissionError("O almoxarifado não pode atualizar essa situação.")
-            saved["status"] = status
-            saved["handled_by"] = user["name"]
-            db.execute("UPDATE records SET data=? WHERE kind='stockRequests' AND id=?",
-                       (json.dumps(saved, ensure_ascii=False), request_id))
+                        inventory["quantity"]=max(0,quantity)
+                        db.execute("UPDATE records SET data=? WHERE organization_id=? AND kind='inventoryItems' AND id=?",
+                                   (json.dumps(inventory,ensure_ascii=False),organization_id,inventory["id"]))
+            saved["status"]=status
+            saved["handled_by"]=user["name"]
+            db.execute("UPDATE records SET data=? WHERE organization_id=? AND kind='stockRequests' AND id=?",
+                       (json.dumps(saved,ensure_ascii=False),organization_id,request_id))
+            self.log_audit(db,user,"update","stockRequests",request_id,f"Solicitação de materiais: {status}")
             return saved
 
     @staticmethod

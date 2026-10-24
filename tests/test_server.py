@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -18,7 +19,7 @@ class AppTest(unittest.TestCase):
         cls.base = 'http://127.0.0.1:' + str(cls.http.server_port)
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.client = build_opener(HTTPCookieProcessor(CookieJar()))
-        setup = Request(cls.base + '/api/setup', json.dumps({'name':'Admin','username':'admin','password':'test-password-123'}).encode(), {'Content-Type':'application/json'})
+        setup = Request(cls.base + '/api/setup', json.dumps({'company_name':'Empresa A','name':'Admin','username':'admin','password':'test-password-123'}).encode(), {'Content-Type':'application/json'})
         with cls.client.open(setup) as response:
             assert response.status == 200
     @classmethod
@@ -31,10 +32,13 @@ class AppTest(unittest.TestCase):
         if origin: headers['Origin'] = origin
         req = Request(self.base + '/api/' + kind, json.dumps(data).encode(), headers)
         with self.client.open(req) as response: return json.load(response)
+    def post_as(self, client, kind, data):
+        req = Request(self.base + '/api/' + kind, json.dumps(data).encode(), {'Content-Type':'application/json'})
+        with client.open(req) as response: return json.load(response)
     def get(self, path, client=None):
         with (client or self.client).open(self.base + path) as response: return json.load(response)
-    def login(self, client, username, password):
-        req = Request(self.base + '/api/login', json.dumps({'username':username,'password':password}).encode(), {'Content-Type':'application/json'})
+    def login(self, client, username, password, company=''):
+        req = Request(self.base + '/api/login', json.dumps({'username':username,'password':password,'company':company}).encode(), {'Content-Type':'application/json'})
         with client.open(req) as response: return json.load(response)
     def test_persistence_and_update(self):
         p = self.post('products', {'name': 'Câmera', 'price': 120})
@@ -104,10 +108,91 @@ class AppTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.post('users/delete', {'user_id':admin_id})
         self.assertEqual(error.exception.code, 400)
+        other_admin = self.post('users', {'name':'Outro administrador','username':'other-admin-test','password':'other-admin-pass-123','role':'admin'})
+        other_admin_client = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(other_admin_client, 'other-admin-test', 'other-admin-pass-123')
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(other_admin_client,'users/update',{'user_id':admin_id,'name':'Alterado','username':'admin','role':'admin','active':True,'password':'changed-password-123'})
+        self.assertEqual(error.exception.code,403)
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(other_admin_client,'users/delete',{'user_id':admin_id})
+        self.assertEqual(error.exception.code,403)
+        self.post('users/delete', {'user_id':other_admin['id']})
         self.post('users/delete', {'user_id':created['id']})
         with self.assertRaises(HTTPError) as error: blocked.open(self.base + '/api/data')
         self.assertEqual(error.exception.code, 401)
         self.assertFalse(any(item['id']==created['id'] for item in self.get('/api/data')['users']))
+    def test_tenant_data_and_members_are_isolated(self):
+        client_a = self.post('clients', {'name':'Cliente exclusivo A'})
+        company = self.post('platform/companies', {'name':'Empresa B','slug':'empresa-b','document':'123','plan':'starter','admin_name':'Admin B','admin_username':'admin','admin_password':'company-b-pass-123'})
+        self.assertEqual(company['company']['slug'],'empresa-b')
+        tenant_b = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
+        data_b = self.get('/api/data',tenant_b)
+        self.assertEqual(data_b['organization']['name'],'Empresa B')
+        self.assertFalse(any(item['name']=='Cliente exclusivo A' for item in data_b['clients']))
+        client_b = self.post_as(tenant_b,'clients',{'name':'Cliente exclusivo B'})
+        for number in range(9):
+            self.post_as(tenant_b,'users',{'name':f'Operador B {number}','username':f'operador-b-{number}','password':'operator-b-pass-123','role':'technician'})
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(tenant_b,'users',{'name':'Limite','username':'operador-b-limite','password':'operator-b-pass-123','role':'technician'})
+        self.assertEqual(error.exception.code,400)
+        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'trial'})
+        self.post_as(tenant_b,'users',{'name':'Operador B Pro','username':'operador-b-pro','password':'operator-b-pass-123','role':'technician'})
+        data_a = self.get('/api/data')
+        self.assertTrue(any(item['id']==client_a['id'] for item in data_a['clients']))
+        self.assertFalse(any(item['id']==client_b['id'] for item in data_a['clients']))
+        with self.assertRaises(HTTPError) as error:
+            self.post_as(tenant_b,'users/delete',{'user_id':next(u['id'] for u in data_a['users'] if u['username']=='admin')})
+        self.assertEqual(error.exception.code,404)
+        with self.assertRaises(HTTPError) as error:
+            self.get('/api/platform/companies',tenant_b)
+        self.assertEqual(error.exception.code,403)
+        with self.assertRaises(HTTPError) as error:
+            self.login(build_opener(HTTPCookieProcessor(CookieJar())),'admin','test-password-123')
+        self.assertEqual(error.exception.code,400)
+        exported=self.get('/api/organization/export',tenant_b)
+        self.assertEqual(exported['organization']['name'],'Empresa B')
+        self.assertTrue(any(row['name']=='Cliente exclusivo B' for row in exported['records']))
+        self.assertFalse(any(row.get('name')=='Cliente exclusivo A' for row in exported['records']))
+        companies=self.get('/api/platform/companies')
+        self.assertEqual(sum(x['id']==company['company']['id'] for x in companies['companies']),1)
+        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'suspended'})
+        with self.assertRaises(HTTPError) as error: tenant_b.open(self.base+'/api/data')
+        self.assertEqual(error.exception.code,401)
+        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'active'})
+        self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
+        self.assertEqual(self.get('/api/data',tenant_b)['organization']['name'],'Empresa B')
+        root_org=self.get('/api/data')['organization']['id']
+        self.post('platform/companies/update',{'id':root_org,'plan':'starter','status':'suspended'})
+        self.assertEqual(len(self.get('/api/platform/companies')['companies']),2)
+        self.post('platform/companies/update',{'id':root_org,'plan':'starter','status':'active'})
+    def test_legacy_database_migrates_without_losing_data(self):
+        previous=server.DB
+        legacy_path=Path(self.temp.name)/'legacy.db'
+        db=sqlite3.connect(legacy_path)
+        db.execute('CREATE TABLE users (id TEXT PRIMARY KEY,username TEXT NOT NULL UNIQUE,name TEXT NOT NULL,role TEXT NOT NULL,salt BLOB NOT NULL,password_hash BLOB NOT NULL,active INTEGER NOT NULL DEFAULT 1,created TEXT NOT NULL)')
+        db.execute('CREATE TABLE sessions (token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires TEXT NOT NULL)')
+        db.execute('CREATE TABLE records (kind TEXT,id TEXT,data TEXT NOT NULL,PRIMARY KEY(kind,id))')
+        db.execute('INSERT INTO users VALUES (?,?,?,?,?,?,1,?)',('legacy-user','admin','Legacy Admin','admin',b'1234567890123456',b'hash','2025-01-01T00:00:00+00:00'))
+        db.execute('INSERT INTO records VALUES (?,?,?)',('company','profile','{"name":"Legacy Company"}'))
+        db.execute('INSERT INTO records VALUES (?,?,?)',('clients','client-1','{"id":"client-1","name":"Legacy Client"}'))
+        db.execute('INSERT INTO sessions VALUES (?,?,?)',('token-hash','legacy-user','2099-01-01T00:00:00+00:00'))
+        db.commit();db.close()
+        try:
+            server.DB=legacy_path
+            with server.connect() as migrated:
+                company=migrated.execute('SELECT name,slug FROM organizations').fetchone()
+                member=migrated.execute('SELECT username,role FROM memberships').fetchone()
+                record=migrated.execute('SELECT data FROM records WHERE kind=? AND id=?',('clients','client-1')).fetchone()
+                session=migrated.execute('SELECT membership_id FROM sessions WHERE token_hash=?',('token-hash',)).fetchone()
+                self.assertEqual(company['name'],'Legacy Company')
+                self.assertEqual(company['slug'],'legacy-company')
+                self.assertEqual(tuple(member),('admin','admin'))
+                self.assertEqual(json.loads(record['data'])['name'],'Legacy Client')
+                self.assertEqual(session['membership_id'],'legacy-user')
+        finally:
+            server.DB=previous
     def test_home(self):
         with urlopen(self.base) as response: self.assertIn('Segura Gestão',response.read().decode())
 
