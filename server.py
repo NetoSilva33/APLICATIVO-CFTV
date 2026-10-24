@@ -97,17 +97,31 @@ class Handler(SimpleHTTPRequestHandler):
             if not user:
                 return
             with connect() as db:
+                records = {key: [] for key in KINDS}
+                for kind, data in db.execute("SELECT kind,data FROM records ORDER BY rowid"):
+                    if kind in records:
+                        records[kind].append(json.loads(data))
                 result = {key: [] for key in KINDS}
                 if user["role"] == "warehouse":
-                    allowed = {"stockRequests", "products"}
+                    result["stockRequests"] = records["stockRequests"]
+                elif user["role"] == "technician":
+                    orders = [o for o in records["orders"] if o.get("technician_id") == user["id"]]
+                    client_ids = {o.get("client_id") for o in orders}
+                    asset_ids = {o.get("asset_id") for o in orders if o.get("asset_id")}
+                    result["orders"] = orders
+                    result["clients"] = [c for c in records["clients"] if c.get("id") in client_ids]
+                    result["assets"] = [a for a in records["assets"] if a.get("id") in asset_ids]
+                    result["maintenance"] = [m for m in records["maintenance"] if m.get("asset_id") in asset_ids]
+                    result["stockRequests"] = [r for r in records["stockRequests"] if r.get("requester_id") == user["id"]]
+                    result["manuals"] = records["manuals"]
                 else:
-                    allowed = KINDS
-                for kind, data in db.execute("SELECT kind,data FROM records ORDER BY rowid"):
-                    if kind in allowed:
-                        result[kind].append(json.loads(data))
+                    result = records
                 if user["role"] == "admin":
                     result["users"] = [dict(id=r[0], username=r[1], name=r[2], role=r[3], active=bool(r[4]))
                                        for r in db.execute("SELECT id,username,name,role,active FROM users ORDER BY name")]
+                if user["role"] in {"admin", "supervisor"}:
+                    result["team"] = [dict(id=r[0], name=r[1], role=r[2])
+                                      for r in db.execute("SELECT id,name,role FROM users WHERE active=1 AND role='technician' ORDER BY name")]
             return self.json_response(200, result)
         if path.startswith("/api/"):
             return self.json_response(404, {"error": "Endereço não encontrado."})
@@ -183,18 +197,73 @@ class Handler(SimpleHTTPRequestHandler):
         if kind not in KINDS:
             return self.json_response(404, {"error": "Cadastro não encontrado."})
         role = user["role"]
-        if role == "warehouse" and kind != "stockRequests":
-            return self.json_response(403, {"error": "Este perfil não pode alterar esse cadastro."})
-        if kind == "stockRequests":
-            if role not in {"admin", "supervisor", "technician", "warehouse"}:
-                return self.json_response(403, {"error": "Este perfil não pode solicitar material."})
-            if role == "technician" and data.get("status", "pending") != "pending":
-                return self.json_response(403, {"error": "Somente o almoxarifado e a supervisão podem atualizar o pedido."})
-        elif role == "technician" and kind not in {"orders", "maintenance"}:
-            return self.json_response(403, {"error": "Este perfil não pode alterar esse cadastro."})
-        elif role == "supervisor" and kind == "users":
-            return self.json_response(403, {"error": "Somente administradores podem gerenciar acessos."})
+        writable = {
+            "admin": KINDS,
+            "supervisor": KINDS,
+            "technician": {"orders", "maintenance", "stockRequests"},
+            "warehouse": {"stockRequests"},
+        }
+        if kind not in writable.get(role, set()):
+            return self.json_response(403, {"error": "Seu perfil não tem permissão para alterar esse cadastro."})
         try:
+            if kind == "orders" and role == "technician":
+                if not data.get("id"):
+                    return self.json_response(403, {"error": "Ordens novas precisam ser atribuídas pela supervisão."})
+                with connect() as db:
+                    row = db.execute("SELECT data FROM records WHERE kind='orders' AND id=?", (data["id"],)).fetchone()
+                if not row:
+                    return self.json_response(404, {"error": "Ordem de serviço não encontrada."})
+                saved = json.loads(row[0])
+                if saved.get("technician_id") != user["id"]:
+                    return self.json_response(403, {"error": "Você só pode atualizar ordens atribuídas à sua conta."})
+                for key in ("client_id", "asset_id", "technician_id", "technician", "title", "summary", "number", "created_at"):
+                    if key in data and data[key] != saved.get(key):
+                        return self.json_response(403, {"error": "Não é permitido alterar os dados de atribuição da ordem."})
+                updated = dict(saved)
+                for key in ("work", "materials", "status", "signature_name", "signature", "signature_at"):
+                    if key in data:
+                        updated[key] = data[key]
+                data = updated
+            elif kind == "orders":
+                technician_id = str(data.get("technician_id", ""))
+                with connect() as db:
+                    technician = db.execute("SELECT id,name FROM users WHERE id=? AND role='technician' AND active=1", (technician_id,)).fetchone()
+                if not technician:
+                    return self.json_response(400, {"error": "Atribua a ordem a uma conta ativa de técnico."})
+                data["technician_id"] = technician["id"]
+                data["technician"] = technician["name"]
+                data["assigned_by"] = user["id"]
+            if kind == "maintenance" and role == "technician":
+                asset_id = str(data.get("asset_id", ""))
+                with connect() as db:
+                    rows = db.execute("SELECT data FROM records WHERE kind='orders'").fetchall()
+                    asset_row = db.execute("SELECT data FROM records WHERE kind='assets' AND id=?", (asset_id,)).fetchone()
+                assigned = any((o := json.loads(row[0])).get("technician_id") == user["id"] and o.get("asset_id") == asset_id for row in rows)
+                if not asset_id or not asset_row or not assigned:
+                    return self.json_response(403, {"error": "A manutenção só pode ser registrada em equipamentos das suas ordens atribuídas."})
+                asset = json.loads(asset_row[0])
+                data["client_id"] = asset["client_id"]
+                data["equipment"] = asset["name"]
+            if kind == "stockRequests" and role == "technician":
+                if data.get("id") or data.get("status", "pending") != "pending":
+                    return self.json_response(403, {"error": "Técnicos podem criar solicitações; almoxarifado ou supervisão atualizam o andamento."})
+                data["requester_id"] = user["id"]
+                data["requester"] = user["name"]
+            elif kind == "stockRequests" and not data.get("id"):
+                data["requester_id"] = user["id"]
+                data["requester"] = user["name"]
+            if kind in {"assets", "orders", "maintenance"}:
+                client_id = str(data.get("client_id", ""))
+                with connect() as db:
+                    client = db.execute("SELECT 1 FROM records WHERE kind='clients' AND id=?", (client_id,)).fetchone()
+                    asset_id = str(data.get("asset_id", ""))
+                    asset_row = db.execute("SELECT data FROM records WHERE kind='assets' AND id=?", (asset_id,)).fetchone() if asset_id else None
+                if not client:
+                    return self.json_response(400, {"error": "O cliente selecionado não existe."})
+                if kind == "orders" and asset_id and (not asset_row or json.loads(asset_row[0]).get("client_id") != client_id):
+                    return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
+                if kind == "maintenance" and asset_id and (not asset_row or json.loads(asset_row[0]).get("client_id") != client_id):
+                    return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
             if role == "warehouse":
                 if not data.get("id") or data.get("status") not in {"approved", "separated", "delivered", "rejected"}:
                     return self.json_response(403, {"error": "O almoxarifado só pode atualizar o andamento de uma solicitação existente."})
