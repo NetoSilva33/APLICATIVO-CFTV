@@ -229,6 +229,71 @@ class Handler(SimpleHTTPRequestHandler):
                 db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (target_id, current_digest))
             return self.json_response(200, {"ok": True, "message": "Senha redefinida. A pessoa precisará entrar novamente."})
 
+        if path == "/api/users/update":
+            if user["role"] != "admin":
+                return self.json_response(403, {"error": "Somente administradores podem editar contas."})
+            target_id = str(data.get("user_id", ""))
+            username = str(data.get("username", "")).strip().lower()
+            name = str(data.get("name", "")).strip()
+            new_role = str(data.get("role", ""))
+            password = str(data.get("password", ""))
+            active = data.get("active")
+            if (not target_id or not username or len(username) > 80 or not name or len(name) > 150
+                    or new_role not in ROLES or not isinstance(active, bool)):
+                return self.json_response(400, {"error": "Informe nome, usuário, perfil e situação válidos."})
+            if password and not 12 <= len(password) <= 1024:
+                return self.json_response(400, {"error": "A nova senha deve ter entre 12 e 1024 caracteres."})
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            current_token = cookie[COOKIE].value if COOKIE in cookie else ""
+            current_digest = hashlib.sha256(current_token.encode()).hexdigest()
+            try:
+                with connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current = db.execute("SELECT id,username,name,role,active FROM users WHERE id=?", (target_id,)).fetchone()
+                    if not current:
+                        return self.json_response(404, {"error": "Conta não encontrada."})
+                    is_self = target_id == user["id"]
+                    if is_self and (new_role != current["role"] or active != bool(current["active"])):
+                        return self.json_response(400, {"error": "Para mudar seu próprio perfil ou situação, outro administrador precisa fazer a alteração."})
+                    if current["role"] == "admin" and current["active"] and (new_role != "admin" or not active):
+                        remaining = db.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (target_id,)).fetchone()[0]
+                        if remaining == 0:
+                            return self.json_response(400, {"error": "Mantenha pelo menos um administrador ativo no sistema."})
+                    if password:
+                        salt = secrets.token_bytes(16)
+                        db.execute("UPDATE users SET username=?,name=?,role=?,active=?,salt=?,password_hash=? WHERE id=?",
+                                   (username, name, new_role, int(active), salt, password_hash(password, salt), target_id))
+                    else:
+                        db.execute("UPDATE users SET username=?,name=?,role=?,active=? WHERE id=?",
+                                   (username, name, new_role, int(active), target_id))
+                    db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (target_id, current_digest))
+                    saved = {"id": target_id, "username": username, "name": name, "role": new_role, "active": active}
+            except sqlite3.IntegrityError:
+                return self.json_response(409, {"error": "Esse nome de usuário já está cadastrado."})
+            return self.json_response(200, {"user": saved, "message": "Conta atualizada. As sessões anteriores foram encerradas."})
+
+        if path == "/api/users/delete":
+            if user["role"] != "admin":
+                return self.json_response(403, {"error": "Somente administradores podem excluir contas."})
+            target_id = str(data.get("user_id", ""))
+            if not target_id:
+                return self.json_response(400, {"error": "Selecione uma conta para excluir."})
+            if target_id == user["id"]:
+                return self.json_response(400, {"error": "Você não pode excluir a própria conta."})
+            with connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                target = db.execute("SELECT role,active FROM users WHERE id=?", (target_id,)).fetchone()
+                if not target:
+                    return self.json_response(404, {"error": "Conta não encontrada."})
+                if target["role"] == "admin" and target["active"]:
+                    remaining = db.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1 AND id<>?", (target_id,)).fetchone()[0]
+                    if remaining == 0:
+                        return self.json_response(400, {"error": "Não é possível excluir o último administrador ativo."})
+                db.execute("DELETE FROM sessions WHERE user_id=?", (target_id,))
+                db.execute("DELETE FROM users WHERE id=?", (target_id,))
+            return self.json_response(200, {"ok": True})
+
         if not path.startswith("/api/"):
             return self.json_response(404, {"error": "Endereço não encontrado."})
         kind = path.removeprefix("/api/")
