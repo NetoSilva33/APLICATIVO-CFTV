@@ -254,6 +254,13 @@ class Handler(SimpleHTTPRequestHandler):
             return None
         return user
 
+    @staticmethod
+    def public_company_user(user):
+        if not user:
+            return None
+        allowed = ("id", "account_id", "username", "name", "role", "organization_name")
+        return {key: user[key] for key in allowed if key in user}
+
     def current_platform_user(self):
         cookie = SimpleCookie()
         try:
@@ -284,7 +291,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/session":
             with connect() as db:
                 has_users = db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]
-            return self.json_response(200, {"setupRequired": not bool(has_users), "user": self.current_user()})
+            return self.json_response(200, {"setupRequired": not bool(has_users), "user": self.public_company_user(self.current_user())})
         if path == "/api/platform/session":
             with connect() as db:
                 has_platform_users = db.execute("SELECT EXISTS(SELECT 1 FROM platform_users)").fetchone()[0]
@@ -303,27 +310,6 @@ class Handler(SimpleHTTPRequestHandler):
                 company["user_limit"] = PLAN_LIMITS.get(company["plan"], PLAN_LIMITS["starter"])
                 companies.append(company)
             return self.json_response(200, {"companies": companies})
-        if path == "/api/organization/export":
-            user = self.require_user()
-            if not user:
-                return
-            if user["role"] != "admin":
-                return self.json_response(403, {"error": "Somente o administrador da empresa pode exportar os dados."})
-            with connect() as db:
-                records = []
-                for row in db.execute("SELECT kind,id,data FROM records WHERE organization_id=? ORDER BY rowid",
-                                      (user["organization_id"],)):
-                    record = json.loads(row[2])
-                    record.update({"kind": row[0], "id": row[1]})
-                    records.append(record)
-                members = [dict(username=row[0],name=row[1],role=row[2],active=bool(row[3]))
-                           for row in db.execute("""SELECT m.username,u.name,m.role,m.active FROM memberships m
-                               JOIN users u ON u.id=m.user_id WHERE m.organization_id=? ORDER BY u.name""",
-                               (user["organization_id"],))]
-                audit = [dict(actor=row[0],action=row[1],kind=row[2],record_id=row[3],summary=row[4],created_at=row[5])
-                         for row in db.execute("SELECT actor_name,action,kind,record_id,summary,created_at FROM audit_logs WHERE organization_id=? ORDER BY created_at",
-                                                (user["organization_id"],))]
-            return self.json_response(200, {"organization": {"id":user["organization_id"],"name":user["organization_name"],"slug":user["organization_slug"],"document":user["organization_document"]},"members":members,"records":records,"audit":audit})
         if path == "/api/data":
             user = self.require_user()
             if not user:
@@ -363,10 +349,7 @@ class Handler(SimpleHTTPRequestHandler):
                     result["manuals"] = records["manuals"]
                 else:
                     result = records
-                result["organization"] = {"id":user["organization_id"],"name":user["organization_name"],
-                    "slug":user["organization_slug"],"document":user["organization_document"],
-                    "plan":user["organization_plan"],"status":user["organization_status"],
-                    "trial_ends_at":user["trial_ends_at"]}
+                result["organization"] = {"name":user["organization_name"]}
                 if user["role"] == "admin":
                     result["users"] = [dict(id=r[0],username=r[1],name=r[2],role=r[3],active=bool(r[4]))
                         for r in db.execute("""SELECT m.id,m.username,u.name,m.role,m.active FROM memberships m
@@ -377,9 +360,6 @@ class Handler(SimpleHTTPRequestHandler):
                         for r in db.execute("""SELECT m.id,u.name,m.role FROM memberships m JOIN users u ON u.id=m.user_id
                             WHERE m.organization_id=? AND m.active=1 AND m.role='technician' ORDER BY u.name""",
                             (user["organization_id"],))]
-                    result["auditLogs"] = [dict(id=r[0],actor=r[1],action=r[2],kind=r[3],record_id=r[4],summary=r[5],created_at=r[6])
-                        for r in db.execute("""SELECT id,actor_name,action,kind,record_id,summary,created_at FROM audit_logs
-                            WHERE organization_id=? ORDER BY created_at DESC LIMIT 100""", (user["organization_id"],))]
             alerts=[]
             today=datetime.now(timezone.utc).date()
             for asset in result.get("assets",[]):
@@ -543,7 +523,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(400,{"error":"Plano ou situação inválidos."})
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                target=db.execute("SELECT id,name,document,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
+                target=db.execute("SELECT id,name,slug,document,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
                 if not target:
                     return self.json_response(404,{"error":"Empresa não encontrada."})
                 users_count=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=?",(org_id,)).fetchone()[0]
@@ -551,26 +531,22 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.json_response(400,{"error":f"Esse plano permite até {PLAN_LIMITS[plan]} acessos; a empresa já tem {users_count}."})
                 name=str(data.get("name",target["name"])).strip()
                 document=str(data.get("document",target["document"])).strip()[:40]
-                if not name or len(name)>180:
-                    return self.json_response(400,{"error":"Informe um nome de empresa válido."})
-                db.execute("UPDATE organizations SET name=?,document=?,plan=?,status=? WHERE id=?",
-                           (name,document,plan,status,org_id))
+                code=str(data.get("slug",target["slug"])).strip()
+                if not name or len(name)>180 or not code or len(code)>80:
+                    return self.json_response(400,{"error":"Informe um nome e um código de empresa válidos."})
+                slug=slugify(code)
+                duplicate=db.execute("SELECT 1 FROM organizations WHERE slug=? AND id<>?",(slug,org_id)).fetchone()
+                if duplicate:
+                    return self.json_response(409,{"error":"Esse código já está sendo usado por outra empresa."})
+                db.execute("UPDATE organizations SET name=?,slug=?,document=?,plan=?,status=? WHERE id=?",
+                           (name,slug,document,plan,status,org_id))
                 platform_actor={**user,"organization_id":org_id,"name":"Plataforma"}
                 self.log_audit(db,platform_actor,"update","organization",org_id,
-                               f"Empresa {name}; plano {target['plan']} → {plan}; situação {target['status']} → {status}")
+                               f"Empresa {name}; código {target['slug']} → {slug}; plano {target['plan']} → {plan}; situação {target['status']} → {status}")
             return self.json_response(200,{"ok":True})
 
         if path == "/api/organization/update":
-            if user["role"]!="admin":
-                return self.json_response(403,{"error":"Somente o administrador da empresa pode alterar seus dados."})
-            name=str(data.get("name","")).strip()
-            document=str(data.get("document","")).strip()[:40]
-            if not name or len(name)>180:
-                return self.json_response(400,{"error":"Informe o nome da empresa."})
-            with connect() as db:
-                db.execute("UPDATE organizations SET name=?,document=? WHERE id=?",(name,document,user["organization_id"]))
-                self.log_audit(db,user,"update","organization",user["organization_id"],"Dados cadastrais da empresa atualizados")
-            return self.json_response(200,{"organization":{"id":user["organization_id"],"name":name,"slug":user["organization_slug"],"document":document}})
+            return self.json_response(403,{"error":"Os dados cadastrais da empresa são gerenciados pelo portal comercial."})
 
         if path == "/api/users":
             if user["role"] != "admin":
@@ -867,9 +843,7 @@ class Handler(SimpleHTTPRequestHandler):
         secure="; Secure" if self.headers.get("X-Forwarded-Proto")=="https" else ""
         cookie=f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS*3600}{secure}"
         session_user={"id":membership_id,"account_id":user_id,"username":username,"name":name,"role":role,
-                      "organization_id":organization_id,
-                      "organization_name":organization.get("name"),"organization_slug":organization.get("slug"),
-                      "organization_plan":organization.get("plan"),"organization_status":organization.get("status")}
+                      "organization_name":organization.get("name")}
         return self.json_response(200,{"user":session_user},(("Set-Cookie",cookie),))
 
     def login_platform_user(self,platform_user):

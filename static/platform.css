@@ -12,7 +12,7 @@ body.platform-body{min-height:100vh;background:#f3f6f8}
 .platform-company-form .fields>*{min-width:0}
 .company-table input,.company-table select{min-width:125px;margin:0}
 .company-table .company-name{min-width:180px}
-.company-table .company-doc{margin-top:6px}
+.company-table .company-code,.company-table .company-doc{margin-top:6px}
 .company-table td{min-width:125px}
 .company-table td:first-child{min-width:235px}
 .company-table td:last-child{text-align:left;min-width:105px}

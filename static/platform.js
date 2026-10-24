@@ -34,7 +34,7 @@ function statusName(status){return status==='active'?'Ativa':status==='trial'?'A
 function formattedDate(value){return value?new Date(value).toLocaleDateString('pt-BR'):'—'}
 function renderCompanies(list){
   const rows=list.map(company=>`<tr data-company-row="${esc(company.id)}">
-    <td><input class="company-name" data-name value="${esc(company.name)}" aria-label="Nome da empresa"><small>Código: ${esc(company.slug)}</small><input class="company-doc" data-document value="${esc(company.document||'')}" aria-label="CNPJ ou documento" placeholder="CNPJ / documento"></td>
+    <td><input class="company-name" data-name value="${esc(company.name)}" aria-label="Nome da empresa"><small>Código para login</small><input class="company-code" data-slug value="${esc(company.slug)}" aria-label="Código para entrar na empresa" maxlength="80"><input class="company-doc" data-document value="${esc(company.document||'')}" aria-label="CNPJ ou documento" placeholder="CNPJ / documento"></td>
     <td><select data-plan aria-label="Plano da empresa">${plans.map(([value,label])=>`<option value="${value}" ${value===company.plan?'selected':''}>${label.split(' · ')[0]}</option>`).join('')}</select></td>
     <td>${Number(company.user_count)||0} / ${Number(company.user_limit)||0}</td>
     <td><span class="badge ${company.status==='suspended'?'late':company.status==='trial'?'soon':''}">${statusName(company.status)}</span>${company.status==='trial'&&company.trial_ends_at?`<br><small>Até ${formattedDate(company.trial_ends_at)}</small>`:''}</td>
@@ -44,7 +44,7 @@ function renderCompanies(list){
   $('#company-table').querySelectorAll('[data-save]').forEach(button=>button.onclick=async()=>{
     const row=button.closest('[data-company-row]');button.disabled=true;
     try{
-      await api('platform/companies/update',{id:button.dataset.save,name:row.querySelector('[data-name]').value.trim(),document:row.querySelector('[data-document]').value.trim(),plan:row.querySelector('[data-plan]').value,status:row.querySelector('[data-status]').value});
+      await api('platform/companies/update',{id:button.dataset.save,name:row.querySelector('[data-name]').value.trim(),slug:row.querySelector('[data-slug]').value.trim(),document:row.querySelector('[data-document]').value.trim(),plan:row.querySelector('[data-plan]').value,status:row.querySelector('[data-status]').value});
       await loadCompanies();toast('Empresa atualizada.');
     }catch(error){toast(error.message)}finally{button.disabled=false}
   });
