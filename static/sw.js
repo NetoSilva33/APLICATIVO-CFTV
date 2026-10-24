@@ -1,4 +1,4 @@
-const CACHE = 'segura-shell-v5';
+const CACHE = 'segura-shell-v6';
 const SHELL = ['/', '/style.css', '/app.js', '/manifest.webmanifest', '/icon.svg', '/plataforma', '/platform.css', '/platform.js'];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))));
 self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key))))));

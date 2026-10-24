@@ -15,12 +15,17 @@ class AppTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         server.DB = Path(cls.temp.name) / 'test.db'
+        server.create_platform_admin('Vendedora','seller','seller-pass-987654')
         cls.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
         cls.base = 'http://127.0.0.1:' + str(cls.http.server_port)
         threading.Thread(target=cls.http.serve_forever, daemon=True).start()
         cls.client = build_opener(HTTPCookieProcessor(CookieJar()))
+        cls.platform_client = build_opener(HTTPCookieProcessor(CookieJar()))
         setup = Request(cls.base + '/api/setup', json.dumps({'company_name':'Empresa A','name':'Admin','username':'admin','password':'test-password-123'}).encode(), {'Content-Type':'application/json'})
         with cls.client.open(setup) as response:
+            assert response.status == 200
+        seller_login = Request(cls.base + '/api/platform/login', json.dumps({'username':'seller','password':'seller-pass-987654'}).encode(), {'Content-Type':'application/json'})
+        with cls.platform_client.open(seller_login) as response:
             assert response.status == 200
     @classmethod
     def tearDownClass(cls):
@@ -35,10 +40,16 @@ class AppTest(unittest.TestCase):
     def post_as(self, client, kind, data):
         req = Request(self.base + '/api/' + kind, json.dumps(data).encode(), {'Content-Type':'application/json'})
         with client.open(req) as response: return json.load(response)
+    def platform_post(self, path, data, client=None):
+        req = Request(self.base + '/api/platform/' + path, json.dumps(data).encode(), {'Content-Type':'application/json'})
+        with (client or self.platform_client).open(req) as response: return json.load(response)
     def get(self, path, client=None):
         with (client or self.client).open(self.base + path) as response: return json.load(response)
     def login(self, client, username, password, company=''):
         req = Request(self.base + '/api/login', json.dumps({'username':username,'password':password,'company':company}).encode(), {'Content-Type':'application/json'})
+        with client.open(req) as response: return json.load(response)
+    def platform_login(self, client, username, password):
+        req = Request(self.base + '/api/platform/login', json.dumps({'username':username,'password':password}).encode(), {'Content-Type':'application/json'})
         with client.open(req) as response: return json.load(response)
     def test_persistence_and_update(self):
         p = self.post('products', {'name': 'Câmera', 'price': 120})
@@ -108,23 +119,35 @@ class AppTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.post('users/delete', {'user_id':admin_id})
         self.assertEqual(error.exception.code, 400)
-        other_admin = self.post('users', {'name':'Outro administrador','username':'other-admin-test','password':'other-admin-pass-123','role':'admin'})
-        other_admin_client = build_opener(HTTPCookieProcessor(CookieJar()))
-        self.login(other_admin_client, 'other-admin-test', 'other-admin-pass-123')
-        with self.assertRaises(HTTPError) as error:
-            self.post_as(other_admin_client,'users/update',{'user_id':admin_id,'name':'Alterado','username':'admin','role':'admin','active':True,'password':'changed-password-123'})
-        self.assertEqual(error.exception.code,403)
-        with self.assertRaises(HTTPError) as error:
-            self.post_as(other_admin_client,'users/delete',{'user_id':admin_id})
-        self.assertEqual(error.exception.code,403)
-        self.post('users/delete', {'user_id':other_admin['id']})
         self.post('users/delete', {'user_id':created['id']})
         with self.assertRaises(HTTPError) as error: blocked.open(self.base + '/api/data')
         self.assertEqual(error.exception.code, 401)
         self.assertFalse(any(item['id']==created['id'] for item in self.get('/api/data')['users']))
+    def test_seller_login_is_separate_from_company_accounts(self):
+        self.assertEqual(self.get('/api/platform/session',self.platform_client)['user']['username'],'seller')
+        self.assertIsNone(self.get('/api/platform/session',self.client)['user'])
+        with self.assertRaises(HTTPError) as error:
+            self.get('/api/platform/companies',self.client)
+        self.assertEqual(error.exception.code,401)
+        with self.assertRaises(HTTPError) as error:
+            self.get('/api/data',self.platform_client)
+        self.assertEqual(error.exception.code,401)
+        wrong_platform=build_opener(HTTPCookieProcessor(CookieJar()))
+        with self.assertRaises(HTTPError) as error:
+            self.platform_login(wrong_platform,'admin','test-password-123')
+        self.assertEqual(error.exception.code,401)
+        wrong_company=build_opener(HTTPCookieProcessor(CookieJar()))
+        with self.assertRaises(HTTPError) as error:
+            self.login(wrong_company,'seller','seller-pass-987654')
+        self.assertEqual(error.exception.code,401)
+        with self.assertRaises(HTTPError) as error:
+            self.platform_post('setup',{'name':'Duplicado','username':'other-seller','password':'another-seller-pass-123'})
+        self.assertEqual(error.exception.code,403)
+        with self.assertRaises(RuntimeError):
+            server.create_platform_admin('Duplicado','other-seller','another-seller-pass-123')
     def test_tenant_data_and_members_are_isolated(self):
         client_a = self.post('clients', {'name':'Cliente exclusivo A'})
-        company = self.post('platform/companies', {'name':'Empresa B','slug':'empresa-b','document':'123','plan':'starter','admin_name':'Admin B','admin_username':'admin','admin_password':'company-b-pass-123'})
+        company = self.platform_post('companies', {'name':'Empresa B','slug':'empresa-b','document':'123','plan':'starter','admin_name':'Admin B','admin_username':'admin','admin_password':'company-b-pass-123'})
         self.assertEqual(company['company']['slug'],'empresa-b')
         tenant_b = build_opener(HTTPCookieProcessor(CookieJar()))
         self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
@@ -137,7 +160,7 @@ class AppTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             self.post_as(tenant_b,'users',{'name':'Limite','username':'operador-b-limite','password':'operator-b-pass-123','role':'technician'})
         self.assertEqual(error.exception.code,400)
-        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'trial'})
+        self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'trial'})
         self.post_as(tenant_b,'users',{'name':'Operador B Pro','username':'operador-b-pro','password':'operator-b-pass-123','role':'technician'})
         data_a = self.get('/api/data')
         self.assertTrue(any(item['id']==client_a['id'] for item in data_a['clients']))
@@ -147,7 +170,7 @@ class AppTest(unittest.TestCase):
         self.assertEqual(error.exception.code,404)
         with self.assertRaises(HTTPError) as error:
             self.get('/api/platform/companies',tenant_b)
-        self.assertEqual(error.exception.code,403)
+        self.assertEqual(error.exception.code,401)
         with self.assertRaises(HTTPError) as error:
             self.login(build_opener(HTTPCookieProcessor(CookieJar())),'admin','test-password-123')
         self.assertEqual(error.exception.code,400)
@@ -155,25 +178,27 @@ class AppTest(unittest.TestCase):
         self.assertEqual(exported['organization']['name'],'Empresa B')
         self.assertTrue(any(row['name']=='Cliente exclusivo B' for row in exported['records']))
         self.assertFalse(any(row.get('name')=='Cliente exclusivo A' for row in exported['records']))
-        companies=self.get('/api/platform/companies')
+        companies=self.get('/api/platform/companies',self.platform_client)
         self.assertEqual(sum(x['id']==company['company']['id'] for x in companies['companies']),1)
-        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'suspended'})
+        self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'suspended'})
         with self.assertRaises(HTTPError) as error: tenant_b.open(self.base+'/api/data')
         self.assertEqual(error.exception.code,401)
-        self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'active'})
+        self.platform_post('companies/update',{'id':company['company']['id'],'plan':'pro','status':'active'})
         self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
         self.assertEqual(self.get('/api/data',tenant_b)['organization']['name'],'Empresa B')
-        self.post('platform/companies/update',{'id':company['company']['id'],'name':'Empresa B Comercial','document':'456','plan':'pro','status':'active'})
-        updated_company=next(row for row in self.get('/api/platform/companies')['companies'] if row['id']==company['company']['id'])
+        self.platform_post('companies/update',{'id':company['company']['id'],'name':'Empresa B Comercial','document':'456','plan':'pro','status':'active'})
+        updated_company=next(row for row in self.get('/api/platform/companies',self.platform_client)['companies'] if row['id']==company['company']['id'])
         self.assertEqual(updated_company['name'],'Empresa B Comercial')
         self.assertEqual(updated_company['document'],'456')
         updated_tenant_data=self.get('/api/data',tenant_b)
         self.assertEqual(updated_tenant_data['organization']['name'],'Empresa B Comercial')
         self.assertTrue(any(log['actor']=='Plataforma' and log['kind']=='organization' for log in updated_tenant_data['auditLogs']))
         root_org=self.get('/api/data')['organization']['id']
-        self.post('platform/companies/update',{'id':root_org,'plan':'starter','status':'suspended'})
-        self.assertEqual(len(self.get('/api/platform/companies')['companies']),2)
-        self.post('platform/companies/update',{'id':root_org,'plan':'starter','status':'active'})
+        self.platform_post('companies/update',{'id':root_org,'plan':'starter','status':'suspended'})
+        with self.assertRaises(HTTPError) as error: self.get('/api/data')
+        self.assertEqual(error.exception.code,401)
+        self.assertEqual(len(self.get('/api/platform/companies',self.platform_client)['companies']),2)
+        self.platform_post('companies/update',{'id':root_org,'plan':'starter','status':'active'})
     def test_legacy_database_migrates_without_losing_data(self):
         previous=server.DB
         legacy_path=Path(self.temp.name)/'legacy.db'
@@ -198,6 +223,28 @@ class AppTest(unittest.TestCase):
                 self.assertEqual(tuple(member),('admin','admin'))
                 self.assertEqual(json.loads(record['data'])['name'],'Legacy Client')
                 self.assertEqual(session['membership_id'],'legacy-user')
+        finally:
+            server.DB=previous
+    def test_existing_company_admin_is_not_reused_as_seller(self):
+        previous=server.DB
+        existing_path=Path(self.temp.name)/'existing-multitenant.db'
+        db=sqlite3.connect(existing_path)
+        db.execute('CREATE TABLE organizations (id TEXT PRIMARY KEY,name TEXT NOT NULL,slug TEXT NOT NULL UNIQUE,document TEXT NOT NULL DEFAULT "",plan TEXT NOT NULL DEFAULT "starter",status TEXT NOT NULL DEFAULT "active",trial_ends_at TEXT,created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE users (id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at TEXT NOT NULL,is_platform_admin INTEGER NOT NULL DEFAULT 0)')
+        db.execute('CREATE TABLE memberships (id TEXT PRIMARY KEY,organization_id TEXT NOT NULL,user_id TEXT NOT NULL,username TEXT NOT NULL,role TEXT NOT NULL,salt BLOB NOT NULL,password_hash BLOB NOT NULL,active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL)')
+        db.execute('CREATE TABLE sessions (token_hash TEXT PRIMARY KEY,membership_id TEXT NOT NULL,expires TEXT NOT NULL)')
+        db.execute('CREATE TABLE records (organization_id TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(organization_id,kind,id))')
+        db.execute('INSERT INTO organizations VALUES (?,?,?,?,?,?,?,?)',('org-1','Empresa Legada','empresa-legada','','starter','active',None,'2025-01-01'))
+        db.execute('INSERT INTO users VALUES (?,?,?,1)',('old-owner','Administrador','2025-01-01'))
+        db.execute('INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)',('member-1','org-1','old-owner','admin','admin',b'salt',b'hash',1,'2025-01-01'))
+        db.execute('INSERT INTO records VALUES (?,?,?,?)',('org-1','clients','client-1','{"name":"Cliente preservado"}'))
+        db.commit();db.close()
+        try:
+            server.DB=existing_path
+            with server.connect() as migrated:
+                self.assertEqual(migrated.execute('SELECT is_platform_admin FROM users WHERE id=?',('old-owner',)).fetchone()[0],0)
+                self.assertEqual(migrated.execute('SELECT COUNT(*) FROM platform_users').fetchone()[0],0)
+                self.assertEqual(json.loads(migrated.execute('SELECT data FROM records WHERE id=?',('client-1',)).fetchone()[0])['name'],'Cliente preservado')
         finally:
             server.DB=previous
     def test_home(self):

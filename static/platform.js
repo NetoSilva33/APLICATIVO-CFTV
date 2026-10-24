@@ -17,19 +17,18 @@ async function getJson(path){
 }
 function toast(message){const element=$('#toast');element.textContent=message;element.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>element.style.display='none',5000)}
 function field(name,label,type='text',extra=''){return `<label>${label}<input name="${name}" type="${type}" ${extra}></label>`}
+function renderNotConfigured(){
+  $('#platform-user').textContent='';$('#platform-logout').hidden=true;
+  $('#platform-app').innerHTML='<section class="platform-notice"><p class="eyebrow">CONFIGURAÇÃO INICIAL DO VENDEDOR</p><h1>O login comercial ainda não foi criado</h1><p>Para manter o portal restrito ao vendedor, crie esse acesso no servidor antes de compartilhar o sistema com empresas.</p><p>Com o servidor parado, abra o terminal na pasta do projeto e execute <code>py -3 server.py --create-platform-admin</code> no Windows ou <code>python3 server.py --create-platform-admin</code> no Linux/macOS.</p><p>Escolha seu nome, usuário e senha no terminal. Depois inicie o servidor novamente e atualize esta página. O acesso comercial não usa as contas dos clientes.</p></section>';
+}
 function renderLogin(message=''){
-  $('#platform-user').textContent='';
-  $('#platform-logout').hidden=true;
-  $('#platform-app').innerHTML=`<section class="auth-card platform-auth"><div class="brand auth-brand"><span class="mark">S</span><span>SEGURA<small>PORTAL COMERCIAL</small></span></div><p class="eyebrow">ACESSO DO VENDEDOR</p><h1>Gerencie as empresas clientes</h1><p>Este portal controla cadastros, planos e situação das empresas. Os registros de serviço e estoque ficam nos sistemas próprios das empresas.</p>${message?`<p class="helper">${esc(message)}</p>`:''}<form id="platform-login-form"><div class="fields"><label>Código da empresa (se necessário)<input name="company" value="${esc(localStorage.getItem('segura-company')||'')}" autocomplete="organization" placeholder="Ex.: minha-empresa"></label>${field('username','Usuário','text','required autocomplete="username" maxlength="80"')}${field('password','Senha','password','required autocomplete="current-password"')}</div><button type="submit">Entrar no portal</button><p class="helper">O primeiro administrador criado neste sistema também recebe o acesso do vendedor.</p></form></section>`;
+  $('#platform-user').textContent='';$('#platform-logout').hidden=true;
+  $('#platform-app').innerHTML=`<section class="auth-card platform-auth"><div class="brand auth-brand"><span class="mark">S</span><span>SEGURA<small>PORTAL COMERCIAL</small></span></div><p class="eyebrow">ACESSO DO VENDEDOR</p><h1>Gerencie as empresas clientes</h1><p>Entre com seu login comercial, separado dos usuários cadastrados pelas empresas.</p>${message?`<p class="helper">${esc(message)}</p>`:''}<form id="platform-login-form"><div class="fields">${field('username','Usuário comercial','text','required autocomplete="username" maxlength="80"')}${field('password','Senha comercial','password','required autocomplete="current-password"')}</div><button type="submit">Entrar no portal</button></form></section>`;
   $('#platform-login-form').onsubmit=async event=>{
     event.preventDefault();const button=event.currentTarget.querySelector('button');button.disabled=true;
-    try{const form=Object.fromEntries(new FormData(event.currentTarget));const result=await api('login',form);user=result.user;if(user.organization_slug)localStorage.setItem('segura-company',user.organization_slug);await showPortal()}
+    try{const result=await api('platform/login',Object.fromEntries(new FormData(event.currentTarget)));user=result.user;await showPortal()}
     catch(error){toast(error.message)}finally{button.disabled=false}
   };
-}
-function showForbidden(){
-  $('#platform-user').textContent='';$('#platform-logout').hidden=true;
-  $('#platform-app').innerHTML='<section class="platform-notice"><p class="eyebrow">ACESSO RESTRITO</p><h1>Este portal é exclusivo do vendedor</h1><p>A conta conectada não possui permissão para administrar empresas. Entre com a conta de plataforma.</p></section>';
 }
 function statusName(status){return status==='active'?'Ativa':status==='trial'?'Avaliação':'Suspensa'}
 function formattedDate(value){return value?new Date(value).toLocaleDateString('pt-BR'):'—'}
@@ -66,7 +65,6 @@ async function loadCompanies(search=''){
   renderCompanies(filtered);
 }
 async function showPortal(){
-  if(!user?.is_platform_admin)return showForbidden();
   $('#platform-user').textContent=`${user.name} · Vendedor`;
   $('#platform-logout').hidden=false;
   $('#platform-app').innerHTML=`<div class="page-head"><div><h1>Painel comercial</h1><p>Controle as empresas clientes e os acessos ao produto. Os dados operacionais de cada empresa não são exibidos aqui.</p></div><button id="export-companies" class="secondary">Exportar empresas CSV</button></div>
@@ -84,12 +82,12 @@ async function showPortal(){
 }
 async function start(){
   try{
-    const session=await getJson('session');
+    const session=await getJson('platform/session');
     user=session.user;
     if(user)return showPortal();
-    if(session.setupRequired)renderLogin('Antes, crie a primeira empresa e o administrador na página inicial do produto.');
+    if(session.setupRequired)renderNotConfigured();
     else renderLogin();
   }catch(error){$('#platform-app').innerHTML=`<section class="platform-notice"><h1>Servidor indisponível</h1><p>${esc(error.message)}</p></section>`}
 }
-$('#platform-logout').onclick=async()=>{try{await api('logout',{});user=null;renderLogin('Sessão encerrada.')}catch(error){toast(error.message)}};
+$('#platform-logout').onclick=async()=>{try{await api('platform/logout',{});user=null;renderLogin('Sessão encerrada.')}catch(error){toast(error.message)}};
 start();

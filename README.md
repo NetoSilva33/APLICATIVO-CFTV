@@ -25,7 +25,7 @@ No Windows, abra `atualizar-e-iniciar.bat` para buscar a versão mais recente da
 
 Se você já cadastrou dados usando uma pasta baixada em ZIP, pare o servidor e copie `data/gestao.db` da pasta antiga para a pasta clonada. Esse banco fica somente no computador e não é enviado ao GitHub.
 
-O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução serve ao próprio computador. Para acessar de outros aparelhos, hospede a aplicação atrás de HTTPS e configure o proxy antes de disponibilizar o endereço à equipe. Crie o administrador antes de expor uma instalação nova. Não exponha o servidor diretamente à internet.
+O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução serve ao próprio computador. Para acessar de outros aparelhos, hospede a aplicação atrás de HTTPS e configure o proxy antes de disponibilizar o endereço à equipe. Crie o administrador da empresa e o login comercial antes de expor uma instalação nova. Não exponha o servidor diretamente à internet.
 
 ## Áreas incluídas
 
@@ -39,7 +39,7 @@ O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução ser
 
 ## Empresas e planos de teste
 
-Na primeira execução, informe o nome da sua empresa e crie o primeiro administrador. Esse primeiro administrador também recebe o acesso de vendedor ao portal separado em `/plataforma` (por exemplo, `http://127.0.0.1:8000/plataforma`). O portal serve para cadastrar empresas clientes, editar seus dados, conferir a quantidade de acessos e controlar plano e situação. Ele não mostra ordens, clientes, equipamentos, estoque nem solicitações das empresas. Cada empresa usa a página inicial do produto e tem seus próprios dados, filtrados também no servidor.
+Na página inicial, crie a empresa de teste e seu administrador. O login comercial é independente: com o servidor parado, crie-o pelo terminal com `py -3 server.py --create-platform-admin` no Windows ou `python3 server.py --create-platform-admin` nos outros sistemas. O comando pede nome, usuário e senha e só pode ser usado uma vez. Depois, inicie o servidor e acesse `/plataforma` (por exemplo, `http://127.0.0.1:8000/plataforma`). Faça essa configuração antes de entregar o endereço a clientes; o portal não oferece cadastro comercial pela internet. Ele serve para cadastrar empresas clientes, editar seus dados, conferir a quantidade de acessos e controlar plano e situação. Não mostra ordens, clientes, equipamentos, estoque nem solicitações das empresas. Cada empresa usa a página inicial do produto e tem seus próprios dados, filtrados também no servidor.
 
 O **código da empresa** aparece na área Empresa. Funcionários podem informá-lo na tela de login; se o nome de usuário for exclusivo, o código pode ficar vazio. O vendedor pode acompanhar as empresas, editar nome e documento, alterar o plano e suspender ou reativar o acesso pelo portal comercial. Os planos Essencial, Profissional e Empresa limitam os acessos a 10, 50 e 500, respectivamente. Empresas cadastradas pelo portal começam com uma avaliação de 14 dias. A gestão de planos é manual nesta versão: cobrança e renovação automáticas ainda não estão conectadas.
 

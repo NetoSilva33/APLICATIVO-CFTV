@@ -1,5 +1,6 @@
 """Segura Gestão: app local de operações para segurança eletrônica."""
 import base64
+import getpass
 import hashlib
 import hmac
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("CFTV_DB", str(ROOT / "data" / "gestao.db")))
 COOKIE = "segura_session"
+PLATFORM_COOKIE = "segura_platform_session"
 ROLES = {"admin", "supervisor", "technician", "warehouse"}
 KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "inventoryItems", "manuals", "products", "quotes", "company"}
 SESSION_HOURS = 12
@@ -62,6 +65,13 @@ def initialize_schema(db):
                and _table_exists(db, "users") and _table_exists(db, "sessions")
                and _table_exists(db, "records") and "organization_id" in _columns(db, "records"))
     if current:
+        db.execute("""CREATE TABLE IF NOT EXISTS platform_users (
+            id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            salt BLOB NOT NULL, password_hash BLOB NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS platform_sessions (
+            token_hash TEXT PRIMARY KEY, platform_user_id TEXT NOT NULL, expires TEXT NOT NULL)""")
+        db.execute("UPDATE users SET is_platform_admin=0 WHERE is_platform_admin<>0")
         db.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
             id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, user_id TEXT,
             actor_name TEXT NOT NULL, action TEXT NOT NULL, kind TEXT NOT NULL,
@@ -98,6 +108,12 @@ def initialize_schema(db):
         UNIQUE(organization_id,user_id))""")
     db.execute("""CREATE TABLE sessions (
         token_hash TEXT PRIMARY KEY, membership_id TEXT NOT NULL, expires TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE platform_users (
+        id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+        salt BLOB NOT NULL, password_hash BLOB NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE platform_sessions (
+        token_hash TEXT PRIMARY KEY, platform_user_id TEXT NOT NULL, expires TEXT NOT NULL)""")
     db.execute("""CREATE TABLE records (
         organization_id TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
         data TEXT NOT NULL, PRIMARY KEY(organization_id,kind,id))""")
@@ -120,13 +136,12 @@ def initialize_schema(db):
         base_slug, slug, suffix = slugify(company_name), slugify(company_name), 2
         while db.execute("SELECT 1 FROM organizations WHERE slug=?", (slug,)).fetchone():
             slug, suffix = f"{base_slug}-{suffix}", suffix + 1
-        legacy_admin = db.execute("SELECT id FROM legacy_users_v1 WHERE role='admin' AND active=1 ORDER BY created,id LIMIT 1").fetchone()
         now = datetime.now(timezone.utc).isoformat()
         db.execute("INSERT INTO organizations VALUES (?,?,?,?,?,?,?,?)",
                    (organization_id, company_name, slug, str(profile.get("document", ""))[:40], "starter", "active", None, now))
         for row in db.execute("SELECT id,username,name,role,salt,password_hash,active,created FROM legacy_users_v1"):
             db.execute("INSERT INTO users VALUES (?,?,?,?)",
-                       (row[0], row[2], row[7], int(legacy_admin and row[0] == legacy_admin[0])))
+                       (row[0], row[2], row[7], 0))
             db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
                        (row[0], organization_id, row[0], row[1], row[3], row[4], row[5], row[6], row[7]))
         if old_sessions:
@@ -149,6 +164,36 @@ def initialize_schema(db):
 
 def password_hash(password, salt):
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ROUNDS)
+
+
+def create_platform_admin(name, username, password):
+    name=str(name).strip()
+    username=str(username).strip().lower()
+    password=str(password)
+    if not username or len(username)>80 or not name or len(name)>150 or not 12<=len(password)<=1024:
+        raise ValueError("Informe nome, usuário e senha comercial com pelo menos 12 caracteres.")
+    now=datetime.now(timezone.utc).isoformat()
+    salt=secrets.token_bytes(16)
+    platform_id=str(uuid4())
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT EXISTS(SELECT 1 FROM platform_users)").fetchone()[0]:
+            raise RuntimeError("O login comercial já foi criado. Não é possível criar outro pelo assistente inicial.")
+        db.execute("INSERT INTO platform_users VALUES (?,?,?,?,?,1,?)",
+                   (platform_id,username,name,salt,password_hash(password,salt),now))
+    return {"id":platform_id,"username":username,"name":name}
+
+
+def setup_platform_admin_interactive():
+    print("Configuração inicial do acesso comercial")
+    name=input("Seu nome: ").strip()
+    username=input("Usuário comercial: ").strip().lower()
+    password=getpass.getpass("Senha comercial (mínimo 12 caracteres): ")
+    confirmation=getpass.getpass("Confirme a senha: ")
+    if password!=confirmation:
+        raise ValueError("As senhas não coincidem.")
+    admin=create_platform_admin(name,username,password)
+    print(f"Login comercial criado para {admin['username']}. Acesse /plataforma ao iniciar o servidor.")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -191,24 +236,43 @@ class Handler(SimpleHTTPRequestHandler):
             row = db.execute("""SELECT u.id AS account_id,m.id AS id,m.username,u.name,m.role,
                 m.organization_id,o.name AS organization_name,o.slug AS organization_slug,
                 o.document AS organization_document,o.plan AS organization_plan,
-                o.status AS organization_status,o.trial_ends_at,u.is_platform_admin
+                o.status AS organization_status,o.trial_ends_at
                 FROM sessions s JOIN memberships m ON m.id=s.membership_id
                 JOIN users u ON u.id=m.user_id JOIN organizations o ON o.id=m.organization_id
                 WHERE s.token_hash=? AND s.expires>? AND m.active=1
-                  AND ((o.status IN ('active','trial')
-                        AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?))
-                       OR u.is_platform_admin=1)""",
+                  AND o.status IN ('active','trial')
+                  AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)""",
                 (digest, now, now)).fetchone()
         if not row:
             return None
-        result = dict(row)
-        result["is_platform_admin"] = bool(result["is_platform_admin"])
-        return result
+        return dict(row)
 
     def require_user(self):
         user = self.current_user()
         if not user:
             self.json_response(401, {"error": "Sua sessão terminou ou a empresa está suspensa. Entre novamente."})
+            return None
+        return user
+
+    def current_platform_user(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            raw = cookie[PLATFORM_COOKIE].value
+        except Exception:
+            return None
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        with connect() as db:
+            row = db.execute("""SELECT u.id,u.username,u.name FROM platform_sessions s
+                JOIN platform_users u ON u.id=s.platform_user_id
+                WHERE s.token_hash=? AND s.expires>? AND u.active=1""", (digest,now)).fetchone()
+        return dict(row) if row else None
+
+    def require_platform_user(self):
+        user = self.current_platform_user()
+        if not user:
+            self.json_response(401, {"error": "Entre com a conta comercial da plataforma."})
             return None
         return user
 
@@ -221,12 +285,14 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as db:
                 has_users = db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]
             return self.json_response(200, {"setupRequired": not bool(has_users), "user": self.current_user()})
+        if path == "/api/platform/session":
+            with connect() as db:
+                has_platform_users = db.execute("SELECT EXISTS(SELECT 1 FROM platform_users)").fetchone()[0]
+            return self.json_response(200, {"setupRequired": not bool(has_platform_users), "user": self.current_platform_user()})
         if path == "/api/platform/companies":
-            user = self.require_user()
+            user = self.require_platform_user()
             if not user:
                 return
-            if not user["is_platform_admin"]:
-                return self.json_response(403, {"error": "Somente a administração da plataforma pode ver as empresas."})
             with connect() as db:
                 rows = db.execute("""SELECT o.*,(SELECT COUNT(*) FROM memberships m WHERE m.organization_id=o.id) AS user_count
                     FROM organizations o ORDER BY o.created_at DESC""").fetchall()
@@ -370,12 +436,12 @@ class Handler(SimpleHTTPRequestHandler):
                     slug=f"{slug}-{secrets.token_hex(2)}"
                 db.execute("INSERT INTO organizations(id,name,slug,plan,status,created_at) VALUES (?,?,?,?,?,?)",
                            (organization_id,company_name,slug,"starter","active",now.isoformat()))
-                db.execute("INSERT INTO users VALUES (?,?,?,1)", (user_id,name,now.isoformat()))
+                db.execute("INSERT INTO users VALUES (?,?,?,0)", (user_id,name,now.isoformat()))
                 db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
                            (membership_id,organization_id,user_id,username,"admin",salt,password_hash(password,salt),1,now.isoformat()))
                 org={"id":organization_id,"name":company_name,"slug":slug,"plan":"starter","status":"active","trial_ends_at":None}
                 self.log_audit(db,{"organization_id":organization_id,"id":membership_id,"name":name},"create","organization",organization_id,"Empresa criada")
-            return self.login_user(membership_id,user_id,organization_id,username,name,"admin",True,org)
+            return self.login_user(membership_id,user_id,organization_id,username,name,"admin",org)
 
         if path == "/api/login":
             username = str(data.get("username", "")).strip().lower()
@@ -383,12 +449,12 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as db:
                 company_slug=str(data.get("company", "")).strip().lower()
                 query="""SELECT m.id AS membership_id,u.id AS user_id,m.organization_id,m.username,u.name,m.role,
-                    m.salt,m.password_hash,m.active,u.is_platform_admin,o.name AS organization_name,
+                    m.salt,m.password_hash,m.active,o.name AS organization_name,
                     o.slug AS organization_slug,o.document AS organization_document,o.plan AS organization_plan,
                     o.status AS organization_status,o.trial_ends_at FROM memberships m JOIN users u ON u.id=m.user_id
                     JOIN organizations o ON o.id=m.organization_id WHERE m.username=? AND m.active=1
-                    AND ((o.status IN ('active','trial') AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?))
-                         OR u.is_platform_admin=1)"""
+                    AND o.status IN ('active','trial')
+                    AND (o.status!='trial' OR o.trial_ends_at IS NULL OR o.trial_ends_at>?)"""
                 params=[username,datetime.now(timezone.utc).isoformat()]
                 if company_slug:
                     query+=" AND o.slug=?"
@@ -403,7 +469,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(401,{"error":"Usuário ou senha incorretos."})
             org={"id":row["organization_id"],"name":row["organization_name"],"slug":row["organization_slug"],
                  "document":row["organization_document"],"plan":row["organization_plan"],"status":row["organization_status"],"trial_ends_at":row["trial_ends_at"]}
-            return self.login_user(row["membership_id"],row["user_id"],row["organization_id"],row["username"],row["name"],row["role"],bool(row["is_platform_admin"]),org)
+            return self.login_user(row["membership_id"],row["user_id"],row["organization_id"],row["username"],row["name"],row["role"],org)
 
         if path == "/api/logout":
             user = self.require_user()
@@ -416,12 +482,34 @@ class Handler(SimpleHTTPRequestHandler):
                 db.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
             return self.json_response(200, {"ok": True}, (("Set-Cookie", f"{COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),))
 
-        user = self.require_user()
+        if path == "/api/platform/setup":
+            return self.json_response(403,{"error":"A conta comercial inicial deve ser criada localmente no servidor."})
+
+        if path == "/api/platform/login":
+            username=str(data.get("username", "")).strip().lower()
+            password=str(data.get("password", ""))
+            with connect() as db:
+                row=db.execute("SELECT id,username,name,salt,password_hash FROM platform_users WHERE username=? AND active=1",(username,)).fetchone()
+            if not row or not hmac.compare_digest(password_hash(password,row["salt"]),row["password_hash"]):
+                return self.json_response(401,{"error":"Usuário ou senha comercial incorretos."})
+            return self.login_platform_user(row)
+
+        if path == "/api/platform/logout":
+            platform_user=self.require_platform_user()
+            if not platform_user:
+                return
+            cookie=SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            token=cookie[PLATFORM_COOKIE].value if PLATFORM_COOKIE in cookie else ""
+            with connect() as db:
+                db.execute("DELETE FROM platform_sessions WHERE token_hash=?",(hashlib.sha256(token.encode()).hexdigest(),))
+            return self.json_response(200,{"ok":True},(("Set-Cookie",f"{PLATFORM_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),))
+
+        platform_routes={"/api/platform/companies","/api/platform/companies/update"}
+        user = self.require_platform_user() if path in platform_routes else self.require_user()
         if not user:
             return
         if path == "/api/platform/companies":
-            if not user["is_platform_admin"]:
-                return self.json_response(403,{"error":"Somente a administração da plataforma pode cadastrar empresas."})
             name=str(data.get("name","")).strip()
             slug=slugify(data.get("slug") or name)
             document=str(data.get("document","")).strip()[:40]
@@ -448,8 +536,6 @@ class Handler(SimpleHTTPRequestHandler):
             return self.json_response(201,{"company":{"id":org_id,"name":name,"slug":slug,"document":document,"plan":plan,"status":"trial","trial_ends_at":(now+timedelta(days=14)).isoformat()},"admin":{"username":admin_username,"name":admin_name}})
 
         if path == "/api/platform/companies/update":
-            if not user["is_platform_admin"]:
-                return self.json_response(403,{"error":"Somente a administração da plataforma pode alterar empresas."})
             org_id=str(data.get("id",""))
             plan=str(data.get("plan",""))
             status=str(data.get("status",""))
@@ -538,14 +624,12 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 with connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    query="""SELECT m.id,m.user_id,m.username,m.role,m.active,u.name,u.is_platform_admin FROM memberships m JOIN users u ON u.id=m.user_id
+                    query="""SELECT m.id,m.user_id,m.username,m.role,m.active,u.name FROM memberships m JOIN users u ON u.id=m.user_id
                         WHERE m.id=? AND m.organization_id=?"""
                     current=db.execute(query,(target_id,user["organization_id"])).fetchone()
                     if not current:
                         return self.json_response(404,{"error":"Conta não encontrada nesta empresa."})
                     is_self=target_id==user["id"]
-                    if current["is_platform_admin"] and not user["is_platform_admin"]:
-                        return self.json_response(403,{"error":"A conta de administração da plataforma só pode ser gerenciada pela própria plataforma."})
                     if current_password_reset:
                         salt=secrets.token_bytes(16)
                         db.execute("UPDATE memberships SET salt=?,password_hash=? WHERE id=?",(salt,password_hash(password,salt),target_id))
@@ -583,12 +667,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(400,{"error":"Você não pode excluir a própria conta."})
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                target=db.execute("""SELECT m.user_id,m.role,m.active,u.name,u.is_platform_admin FROM memberships m JOIN users u ON u.id=m.user_id
+                target=db.execute("""SELECT m.user_id,m.role,m.active,u.name FROM memberships m JOIN users u ON u.id=m.user_id
                     WHERE m.id=? AND m.organization_id=?""",(target_id,user["organization_id"])).fetchone()
                 if not target:
                     return self.json_response(404,{"error":"Conta não encontrada nesta empresa."})
-                if target["is_platform_admin"]:
-                    return self.json_response(403,{"error":"A conta de administração da plataforma não pode ser excluída por um administrador de empresa."})
                 if target["role"]=="admin" and target["active"]:
                     remaining=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=? AND role='admin' AND active=1 AND id<>?",
                                          (user["organization_id"],target_id)).fetchone()[0]
@@ -776,7 +858,7 @@ class Handler(SimpleHTTPRequestHandler):
         except sqlite3.Error:
             return self.json_response(500, {"error": "Não foi possível salvar no banco de dados."})
 
-    def login_user(self,membership_id,user_id,organization_id,username,name,role,is_platform_admin,organization):
+    def login_user(self,membership_id,user_id,organization_id,username,name,role,organization):
         token=secrets.token_urlsafe(32)
         digest=hashlib.sha256(token.encode()).hexdigest()
         expires=datetime.now(timezone.utc)+timedelta(hours=SESSION_HOURS)
@@ -785,9 +867,22 @@ class Handler(SimpleHTTPRequestHandler):
         secure="; Secure" if self.headers.get("X-Forwarded-Proto")=="https" else ""
         cookie=f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS*3600}{secure}"
         session_user={"id":membership_id,"account_id":user_id,"username":username,"name":name,"role":role,
-                      "is_platform_admin":bool(is_platform_admin),"organization_id":organization_id,
+                      "organization_id":organization_id,
                       "organization_name":organization.get("name"),"organization_slug":organization.get("slug"),
                       "organization_plan":organization.get("plan"),"organization_status":organization.get("status")}
+        return self.json_response(200,{"user":session_user},(("Set-Cookie",cookie),))
+
+    def login_platform_user(self,platform_user):
+        token=secrets.token_urlsafe(32)
+        digest=hashlib.sha256(token.encode()).hexdigest()
+        expires=datetime.now(timezone.utc)+timedelta(hours=SESSION_HOURS)
+        with connect() as db:
+            db.execute("INSERT INTO platform_sessions VALUES (?,?,?)",
+                       (digest,platform_user["id"],expires.isoformat()))
+        secure="; Secure" if self.headers.get("X-Forwarded-Proto")=="https" else ""
+        cookie=f"{PLATFORM_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_HOURS*3600}{secure}"
+        session_user={"id":platform_user["id"],"username":platform_user["username"],
+                      "name":platform_user["name"]}
         return self.json_response(200,{"user":session_user},(("Set-Cookie",cookie),))
 
     @staticmethod
@@ -999,6 +1094,16 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--create-platform-admin"]:
+        try:
+            setup_platform_admin_interactive()
+        except (ValueError,RuntimeError,sqlite3.Error) as error:
+            print(f"Não foi possível criar o login comercial: {error}",file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+    if sys.argv[1:]:
+        print("Uso: python server.py [--create-platform-admin]", file=sys.stderr)
+        raise SystemExit(2)
     with connect() as db:
         db.execute("DELETE FROM sessions WHERE expires<?", (datetime.now(timezone.utc).isoformat(),))
     port = int(os.environ.get("PORT", "8000"))
