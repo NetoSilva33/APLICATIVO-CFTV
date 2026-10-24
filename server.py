@@ -1,4 +1,5 @@
 """Segura Gestão: app local de operações para segurança eletrônica."""
+import base64
 import hashlib
 import hmac
 import json
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("CFTV_DB", str(ROOT / "data" / "gestao.db")))
 COOKIE = "segura_session"
 ROLES = {"admin", "supervisor", "technician", "warehouse"}
-KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "manuals", "products", "quotes", "company"}
+KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "manuals", "products", "quotes", "company"}
 SESSION_HOURS = 12
 PBKDF2_ROUNDS = 310_000
 
@@ -104,6 +105,7 @@ class Handler(SimpleHTTPRequestHandler):
                 result = {key: [] for key in KINDS}
                 if user["role"] == "warehouse":
                     result["stockRequests"] = records["stockRequests"]
+                    result["purchaseRequests"] = records["purchaseRequests"]
                 elif user["role"] == "technician":
                     orders = [o for o in records["orders"] if o.get("technician_id") == user["id"]]
                     client_ids = {o.get("client_id") for o in orders}
@@ -113,6 +115,7 @@ class Handler(SimpleHTTPRequestHandler):
                     result["assets"] = [a for a in records["assets"] if a.get("id") in asset_ids]
                     result["maintenance"] = [m for m in records["maintenance"] if m.get("asset_id") in asset_ids]
                     result["stockRequests"] = [r for r in records["stockRequests"] if r.get("requester_id") == user["id"]]
+                    result["purchaseRequests"] = [r for r in records["purchaseRequests"] if r.get("requester_id") == user["id"]]
                     result["manuals"] = records["manuals"]
                 else:
                     result = records
@@ -200,8 +203,8 @@ class Handler(SimpleHTTPRequestHandler):
         writable = {
             "admin": KINDS,
             "supervisor": KINDS,
-            "technician": {"orders", "maintenance", "stockRequests"},
-            "warehouse": {"stockRequests"},
+            "technician": {"orders", "maintenance", "stockRequests", "purchaseRequests"},
+            "warehouse": {"stockRequests", "purchaseRequests"},
         }
         if kind not in writable.get(role, set()):
             return self.json_response(403, {"error": "Seu perfil não tem permissão para alterar esse cadastro."})
@@ -252,6 +255,24 @@ class Handler(SimpleHTTPRequestHandler):
             elif kind == "stockRequests" and not data.get("id"):
                 data["requester_id"] = user["id"]
                 data["requester"] = user["name"]
+            if kind == "purchaseRequests":
+                if data.get("id") and role == "technician":
+                    return self.json_response(403, {"error": "Seu perfil pode criar solicitações, mas não atualizar o andamento."})
+                if not data.get("id"):
+                    data["status"] = "pending"
+                    data["requester_id"] = user["id"]
+                    data["requester"] = user["name"]
+                elif role in {"admin", "supervisor"}:
+                    if data.get("status") not in {"approved", "ordered", "received", "rejected"}:
+                        return self.json_response(400, {"error": "Situação de compra inválida."})
+                    with connect() as db:
+                        current = db.execute("SELECT data FROM records WHERE kind='purchaseRequests' AND id=?", (data["id"],)).fetchone()
+                    if not current:
+                        return self.json_response(404, {"error": "Solicitação de compra não encontrada."})
+                    saved = json.loads(current[0])
+                    saved["status"] = data["status"]
+                    saved["handled_by"] = user["name"]
+                    data = saved
             if kind in {"assets", "orders", "maintenance"}:
                 client_id = str(data.get("client_id", ""))
                 with connect() as db:
@@ -264,7 +285,21 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
                 if kind == "maintenance" and asset_id and (not asset_row or json.loads(asset_row[0]).get("client_id") != client_id):
                     return self.json_response(400, {"error": "O equipamento precisa pertencer ao cliente selecionado."})
-            if role == "warehouse":
+            if role == "warehouse" and kind == "purchaseRequests" and data.get("id"):
+                if data.get("status") not in {"ordered", "received"}:
+                    return self.json_response(403, {"error": "O almoxarifado pode atualizar pedidos aprovados para realizado ou recebido."})
+                with connect() as db:
+                    current = db.execute("SELECT data FROM records WHERE kind='purchaseRequests' AND id=?", (data["id"],)).fetchone()
+                if not current:
+                    return self.json_response(404, {"error": "Solicitação de compra não encontrada."})
+                saved = json.loads(current[0])
+                allowed_status = {"approved": {"ordered"}, "ordered": {"received"}}
+                if data["status"] not in allowed_status.get(saved.get("status"), set()):
+                    return self.json_response(403, {"error": "A compra precisa ser aprovada antes do pedido e marcada como realizado antes de recebida."})
+                saved["status"] = data["status"]
+                saved["handled_by"] = user["name"]
+                data = saved
+            elif role == "warehouse" and kind == "stockRequests":
                 if not data.get("id") or data.get("status") not in {"approved", "separated", "delivered", "rejected"}:
                     return self.json_response(403, {"error": "O almoxarifado só pode atualizar o andamento de uma solicitação existente."})
                 with connect() as db:
@@ -332,6 +367,40 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Informe o material e uma quantidade válida.")
             if data.get("status", "pending") not in {"pending", "approved", "separated", "delivered", "rejected"}:
                 raise ValueError("Status do pedido inválido.")
+        if kind == "purchaseRequests":
+            if not str(data.get("item", "")).strip() or len(str(data.get("item", ""))) > 180:
+                raise ValueError("Informe o material ou ferramenta que deseja comprar.")
+            quantity = float(data.get("quantity", 0))
+            if not 0 < quantity <= 1_000_000:
+                raise ValueError("Informe uma quantidade válida.")
+            if data.get("estimated_cost") not in (None, "") and not 0 <= float(data["estimated_cost"]) <= 1_000_000_000:
+                raise ValueError("O valor estimado é inválido.")
+            if data.get("url") and not str(data["url"]).startswith(("https://", "http://")):
+                raise ValueError("O link de compra deve começar com https:// ou http://.")
+            if data.get("status", "pending") not in {"pending", "approved", "ordered", "received", "rejected"}:
+                raise ValueError("Situação da compra inválida.")
+            images = data.get("images", [])
+            if not isinstance(images, list) or len(images) > 3:
+                raise ValueError("Anexe no máximo três fotos.")
+            signatures = {"image/png": b"\x89PNG\r\n\x1a\n", "image/jpeg": b"\xff\xd8\xff", "image/webp": None}
+            for image in images:
+                if not isinstance(image, dict) or image.get("mime") not in signatures or len(str(image.get("name", ""))) > 180:
+                    raise ValueError("Formato de foto inválido. Use PNG, JPEG ou WebP.")
+                data_url = str(image.get("data", ""))
+                prefix = f"data:{image['mime']};base64,"
+                if not data_url.startswith(prefix):
+                    raise ValueError("Os dados da foto não correspondem ao formato informado.")
+                try:
+                    payload = base64.b64decode(data_url[len(prefix):], validate=True)
+                except ValueError:
+                    raise ValueError("Uma das fotos está corrompida.") from None
+                if not 0 < len(payload) <= 1_000_000:
+                    raise ValueError("Cada foto deve ter no máximo 1 MB.")
+                magic = signatures[image["mime"]]
+                if magic and not payload.startswith(magic):
+                    raise ValueError("O conteúdo de uma foto não corresponde ao seu formato.")
+                if image["mime"] == "image/webp" and (len(payload) < 12 or payload[:4] != b"RIFF" or payload[8:12] != b"WEBP"):
+                    raise ValueError("O conteúdo da foto não corresponde ao formato WebP.")
         if kind == "manuals":
             if not str(data.get("title", "")).strip():
                 raise ValueError("Informe o título do manual.")

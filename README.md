@@ -33,8 +33,9 @@ O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução ser
 - **Clientes e equipamentos:** cadastro de clientes e equipamentos vinculados, fabricante, modelo, número de série ou local.
 - **Manutenção:** registro de visita, histórico por equipamento e datas da última e próxima manutenção, com alertas de vencimento.
 - **Almoxarifado:** técnicos enviam pedidos; almoxarifado e supervisão atualizam o andamento.
+- **Compras:** qualquer usuário pode solicitar material ou ferramenta com quantidade, prioridade, link, justificativa, valor estimado e até três fotos. Administradores e supervisores aprovam ou recusam; o almoxarifado marca pedidos aprovados como realizados e recebidos.
 - **Manuais técnicos:** catálogo de documentos e referências fornecidos pela empresa, com links para os arquivos ou páginas oficiais.
-- **Acessos:** administrador controla todo o sistema e as contas; supervisor administra clientes, equipamentos, ordens e materiais e atribui ordens a técnicos; técnico vê apenas suas ordens atribuídas, os clientes/equipamentos ligados a elas, as manutenções correspondentes, manuais e seus próprios pedidos; almoxarifado vê os pedidos e atualiza sua situação. Senhas são armazenadas com derivação PBKDF2 e a sessão usa cookie HttpOnly.
+- **Acessos:** administrador controla todo o sistema e as contas; supervisor administra clientes, equipamentos, ordens e materiais e atribui ordens a técnicos; técnico vê apenas suas ordens atribuídas, os clientes/equipamentos ligados a elas, as manutenções correspondentes, manuais e seus próprios pedidos; almoxarifado vê pedidos de estoque e compras e atualiza seu andamento. Todos os perfis podem abrir solicitações de compra. Senhas são armazenadas com derivação PBKDF2 e a sessão usa cookie HttpOnly.
 
 Para salvar uma ordem em PDF, abra a ordem e escolha **Salvar ordem em PDF**. Na janela do navegador, selecione **Salvar como PDF**. A assinatura fica armazenada como imagem no banco SQLite junto com a ordem.
 
