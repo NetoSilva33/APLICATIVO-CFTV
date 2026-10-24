@@ -39,9 +39,9 @@ O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução ser
 
 ## Empresas e planos de teste
 
-Na primeira execução, informe o nome da sua empresa e crie o primeiro administrador. Esse primeiro administrador também recebe o acesso **Plataforma**, de onde pode cadastrar empresas para teste e criar o primeiro administrador de cada uma. Cada empresa tem seu próprio cadastro de clientes, funcionários, ordens, equipamentos, estoque e solicitações. Os dados e as contas são filtrados pela empresa também no servidor.
+Na primeira execução, informe o nome da sua empresa e crie o primeiro administrador. Esse primeiro administrador também recebe o acesso de vendedor ao portal separado em `/plataforma` (por exemplo, `http://127.0.0.1:8000/plataforma`). O portal serve para cadastrar empresas clientes, editar seus dados, conferir a quantidade de acessos e controlar plano e situação. Ele não mostra ordens, clientes, equipamentos, estoque nem solicitações das empresas. Cada empresa usa a página inicial do produto e tem seus próprios dados, filtrados também no servidor.
 
-O **código da empresa** aparece na área Empresa. Funcionários podem informá-lo na tela de login; se o nome de usuário for exclusivo, o código pode ficar vazio. O administrador da plataforma pode acompanhar as empresas, alterar o plano de teste e suspender ou reativar o acesso. Os planos Essencial, Profissional e Empresa limitam os acessos a 10, 50 e 500, respectivamente. Empresas cadastradas pela plataforma começam com uma avaliação de 14 dias. A gestão de planos é manual nesta versão: cobrança e renovação automáticas ainda não estão conectadas.
+O **código da empresa** aparece na área Empresa. Funcionários podem informá-lo na tela de login; se o nome de usuário for exclusivo, o código pode ficar vazio. O vendedor pode acompanhar as empresas, editar nome e documento, alterar o plano e suspender ou reativar o acesso pelo portal comercial. Os planos Essencial, Profissional e Empresa limitam os acessos a 10, 50 e 500, respectivamente. Empresas cadastradas pelo portal começam com uma avaliação de 14 dias. A gestão de planos é manual nesta versão: cobrança e renovação automáticas ainda não estão conectadas.
 
 Administradores e supervisores têm abas de alertas, relatórios e auditoria. O administrador também pode exportar os dados da própria empresa em JSON pela área Empresa. Instalações antigas com um banco de dados de uma única empresa são migradas automaticamente no primeiro início desta versão. Faça uma cópia do arquivo `data/gestao.db` antes de atualizar.
 
@@ -51,7 +51,7 @@ Para salvar uma ordem em PDF, abra a ordem e escolha **Salvar ordem em PDF**. Na
 
 O banco persistente fica em `data/gestao.db` e é criado automaticamente. `CFTV_DB` permite escolher outro caminho. Para backup, feche o servidor e copie a pasta `data`; não envie o banco ao GitHub. Os dados que já estavam no banco permanecem armazenados.
 
-Esta entrega é uma base para testes multempresa no próprio computador. Ela ainda usa SQLite local e não inclui hospedagem pública, PostgreSQL, cobrança automática, convites por e-mail, envio de PDF por e-mail/WhatsApp, armazenamento de arquivo de manual dentro do app, assinatura digital certificada ou sincronização em nuvem. Para testar em vários aparelhos ou usar dados reais em produção, ainda é necessário configurar hospedagem com HTTPS, banco de dados gerenciado, backups e política de acesso adequada. Não exponha o servidor de desenvolvimento diretamente à internet.
+Esta entrega é uma base para testes multempresa no próprio computador. O menu lateral rola quando as opções não cabem na tela. A versão ainda usa SQLite local e não inclui hospedagem pública, PostgreSQL, cobrança automática, convites por e-mail, envio de PDF por e-mail/WhatsApp, armazenamento de arquivo de manual dentro do app, assinatura digital certificada ou sincronização em nuvem. Para testar em vários aparelhos ou usar dados reais em produção, ainda é necessário configurar hospedagem com HTTPS, banco de dados gerenciado, backups e política de acesso adequada. Não exponha o servidor de desenvolvimento diretamente à internet.
 
 ## Verificações
 

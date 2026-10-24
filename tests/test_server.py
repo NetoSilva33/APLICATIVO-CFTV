@@ -163,6 +163,13 @@ class AppTest(unittest.TestCase):
         self.post('platform/companies/update',{'id':company['company']['id'],'plan':'pro','status':'active'})
         self.login(tenant_b,'admin','company-b-pass-123','empresa-b')
         self.assertEqual(self.get('/api/data',tenant_b)['organization']['name'],'Empresa B')
+        self.post('platform/companies/update',{'id':company['company']['id'],'name':'Empresa B Comercial','document':'456','plan':'pro','status':'active'})
+        updated_company=next(row for row in self.get('/api/platform/companies')['companies'] if row['id']==company['company']['id'])
+        self.assertEqual(updated_company['name'],'Empresa B Comercial')
+        self.assertEqual(updated_company['document'],'456')
+        updated_tenant_data=self.get('/api/data',tenant_b)
+        self.assertEqual(updated_tenant_data['organization']['name'],'Empresa B Comercial')
+        self.assertTrue(any(log['actor']=='Plataforma' and log['kind']=='organization' for log in updated_tenant_data['auditLogs']))
         root_org=self.get('/api/data')['organization']['id']
         self.post('platform/companies/update',{'id':root_org,'plan':'starter','status':'suspended'})
         self.assertEqual(len(self.get('/api/platform/companies')['companies']),2)
@@ -195,5 +202,9 @@ class AppTest(unittest.TestCase):
             server.DB=previous
     def test_home(self):
         with urlopen(self.base) as response: self.assertIn('Segura Gestão',response.read().decode())
+        with urlopen(self.base+'/plataforma') as response:
+            portal=response.read().decode()
+            self.assertIn('PORTAL COMERCIAL',portal)
+            self.assertIn('platform.js',portal)
 
 if __name__ == '__main__': unittest.main()

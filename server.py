@@ -214,6 +214,9 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path in {"/plataforma", "/plataforma/", "/platform"}:
+            self.path = "/platform.html"
+            return super().do_GET()
         if path == "/api/session":
             with connect() as db:
                 has_users = db.execute("SELECT EXISTS(SELECT 1 FROM users)").fetchone()[0]
@@ -439,7 +442,7 @@ class Handler(SimpleHTTPRequestHandler):
                     db.execute("INSERT INTO users VALUES (?,?,?,0)",(user_id,admin_name,now.isoformat()))
                     db.execute("INSERT INTO memberships VALUES (?,?,?,?,?,?,?,?,?)",
                                (membership_id,org_id,user_id,admin_username,"admin",salt,password_hash(admin_password,salt),1,now.isoformat()))
-                    self.log_audit(db,{"organization_id":org_id,"id":user["id"],"name":user["name"]},"create","organization",org_id,"Empresa e administrador inicial cadastrados")
+                    self.log_audit(db,{"organization_id":org_id,"id":user["id"],"name":"Plataforma"},"create","organization",org_id,"Empresa e administrador inicial cadastrados")
             except sqlite3.IntegrityError:
                 return self.json_response(409,{"error":"O código da empresa ou nome de usuário já existe nessa empresa."})
             return self.json_response(201,{"company":{"id":org_id,"name":name,"slug":slug,"document":document,"plan":plan,"status":"trial","trial_ends_at":(now+timedelta(days=14)).isoformat()},"admin":{"username":admin_username,"name":admin_name}})
@@ -454,14 +457,21 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(400,{"error":"Plano ou situação inválidos."})
             with connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                target=db.execute("SELECT id,name,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
+                target=db.execute("SELECT id,name,document,plan,status FROM organizations WHERE id=?",(org_id,)).fetchone()
                 if not target:
                     return self.json_response(404,{"error":"Empresa não encontrada."})
                 users_count=db.execute("SELECT COUNT(*) FROM memberships WHERE organization_id=?",(org_id,)).fetchone()[0]
                 if users_count>PLAN_LIMITS[plan]:
                     return self.json_response(400,{"error":f"Esse plano permite até {PLAN_LIMITS[plan]} acessos; a empresa já tem {users_count}."})
-                db.execute("UPDATE organizations SET plan=?,status=? WHERE id=?",(plan,status,org_id))
-                self.log_audit(db,{"organization_id":org_id,"id":user["id"],"name":user["name"]},"update","organization",org_id,f"Plano {target['plan']} → {plan}; situação {target['status']} → {status}")
+                name=str(data.get("name",target["name"])).strip()
+                document=str(data.get("document",target["document"])).strip()[:40]
+                if not name or len(name)>180:
+                    return self.json_response(400,{"error":"Informe um nome de empresa válido."})
+                db.execute("UPDATE organizations SET name=?,document=?,plan=?,status=? WHERE id=?",
+                           (name,document,plan,status,org_id))
+                platform_actor={**user,"organization_id":org_id,"name":"Plataforma"}
+                self.log_audit(db,platform_actor,"update","organization",org_id,
+                               f"Empresa {name}; plano {target['plan']} → {plan}; situação {target['status']} → {status}")
             return self.json_response(200,{"ok":True})
 
         if path == "/api/organization/update":

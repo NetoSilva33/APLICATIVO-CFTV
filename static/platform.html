@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#102c34">
+  <meta name="description" content="Painel comercial da plataforma Segura Gestão.">
+  <title>Portal do vendedor | Segura Gestão</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="platform.css">
+</head>
+<body class="platform-body">
+  <main class="platform-main">
+    <header class="platform-header">
+      <a class="brand platform-brand" href="/plataforma"><span class="mark">S</span><span>SEGURA<small>PORTAL COMERCIAL</small></span></a>
+      <div class="platform-user"><span id="platform-user"></span><button id="platform-logout" class="secondary small" hidden>Sair</button></div>
+    </header>
+    <div id="platform-app" aria-live="polite"><div class="loading">Carregando portal…</div></div>
+  </main>
+  <div role="status" id="toast" aria-live="assertive"></div>
+  <script src="platform.js" defer></script>
+</body>
+</html>

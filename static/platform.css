@@ -1,0 +1,24 @@
+body.platform-body{min-height:100vh;background:#f3f6f8}
+.platform-main{margin:0 auto;padding:24px 32px 56px;max-width:1480px}
+.platform-header{min-height:74px;display:flex;align-items:center;justify-content:space-between;gap:20px;border-bottom:1px solid #dfe6e9;margin-bottom:28px}
+.platform-brand{color:#102c34}
+.platform-user{display:flex;align-items:center;gap:14px;color:#405865;font-size:13px}
+.platform-user button{letter-spacing:0}
+.platform-auth{max-width:520px;margin:8vh auto 0}
+.platform-auth .fields{grid-template-columns:1fr}
+.platform-auth .fields>*{grid-column:1}
+.platform-stats{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:22px}
+.platform-company-form .fields{grid-template-columns:repeat(2,minmax(0,1fr))}
+.platform-company-form .fields>*{min-width:0}
+.company-table input,.company-table select{min-width:125px;margin:0}
+.company-table .company-name{min-width:180px}
+.company-table .company-doc{margin-top:6px}
+.company-table td{min-width:125px}
+.company-table td:first-child{min-width:235px}
+.company-table td:last-child{text-align:left;min-width:105px}
+.platform-notice{max-width:680px;margin:9vh auto;padding:28px}
+.platform-search{max-width:440px;margin:0 0 18px}
+.platform-result{padding:14px 16px;border:1px solid #bde7d9;background:#eefaf5;color:#256b56;border-radius:8px;margin:16px 0;line-height:1.6}
+.platform-result:empty{display:none}
+@media(max-width:850px){.platform-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.platform-main{padding:12px 14px 32px}.platform-header{align-items:flex-start;padding:12px 0}.platform-brand{font-size:16px}.platform-user{font-size:11px;gap:7px}.platform-stats{grid-template-columns:1fr 1fr;gap:10px}.platform-stats section{padding:14px}.platform-stats .stat{font-size:27px}.platform-company-form .fields{grid-template-columns:1fr}.platform-company-form .fields>*{grid-column:1}.platform-auth{margin-top:4vh}}
