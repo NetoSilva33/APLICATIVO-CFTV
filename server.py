@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("CFTV_DB", str(ROOT / "data" / "gestao.db")))
 COOKIE = "segura_session"
 ROLES = {"admin", "supervisor", "technician", "warehouse"}
-KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "manuals", "products", "quotes", "company"}
+KINDS = {"clients", "assets", "orders", "maintenance", "stockRequests", "purchaseRequests", "inventoryItems", "manuals", "products", "quotes", "company"}
 SESSION_HOURS = 12
 PBKDF2_ROUNDS = 310_000
 
@@ -102,10 +103,23 @@ class Handler(SimpleHTTPRequestHandler):
                 for kind, data in db.execute("SELECT kind,data FROM records ORDER BY rowid"):
                     if kind in records:
                         records[kind].append(json.loads(data))
+                reserved = {}
+                for request in records["stockRequests"]:
+                    if request.get("status") in {"pending", "approved", "separated"}:
+                        for item in request.get("items", []):
+                            item_id = item.get("item_id")
+                            reserved[item_id] = reserved.get(item_id, 0) + float(item.get("quantity", 0))
+                records["inventoryItems"] = [
+                    {**item,
+                     "reserved_quantity": reserved.get(item["id"], 0),
+                     "available_quantity": max(0, float(item.get("quantity", 0)) - reserved.get(item["id"], 0))}
+                    for item in records["inventoryItems"]
+                ]
                 result = {key: [] for key in KINDS}
                 if user["role"] == "warehouse":
                     result["stockRequests"] = records["stockRequests"]
                     result["purchaseRequests"] = records["purchaseRequests"]
+                    result["inventoryItems"] = records["inventoryItems"]
                 elif user["role"] == "technician":
                     orders = [o for o in records["orders"] if o.get("technician_id") == user["id"]]
                     client_ids = {o.get("client_id") for o in orders}
@@ -116,6 +130,7 @@ class Handler(SimpleHTTPRequestHandler):
                     result["maintenance"] = [m for m in records["maintenance"] if m.get("asset_id") in asset_ids]
                     result["stockRequests"] = [r for r in records["stockRequests"] if r.get("requester_id") == user["id"]]
                     result["purchaseRequests"] = [r for r in records["purchaseRequests"] if r.get("requester_id") == user["id"]]
+                    result["inventoryItems"] = records["inventoryItems"]
                     result["manuals"] = records["manuals"]
                 else:
                     result = records
@@ -194,6 +209,26 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.json_response(409, {"error": "Esse nome de usuário já está cadastrado."})
             return self.json_response(201, {"id": user_id, "username": username, "name": name, "role": role, "active": True})
 
+        if path == "/api/users/reset-password":
+            if user["role"] != "admin":
+                return self.json_response(403, {"error": "Somente administradores podem redefinir senhas."})
+            target_id = str(data.get("user_id", ""))
+            password = str(data.get("password", ""))
+            if not target_id or len(password) < 12 or len(password) > 1024:
+                return self.json_response(400, {"error": "Informe uma nova senha com pelo menos 12 caracteres."})
+            salt = secrets.token_bytes(16)
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie", ""))
+            current_token = cookie[COOKIE].value if COOKIE in cookie else ""
+            current_digest = hashlib.sha256(current_token.encode()).hexdigest()
+            with connect() as db:
+                changed = db.execute("UPDATE users SET salt=?,password_hash=? WHERE id=?",
+                                     (salt, password_hash(password, salt), target_id)).rowcount
+                if not changed:
+                    return self.json_response(404, {"error": "Conta não encontrada."})
+                db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (target_id, current_digest))
+            return self.json_response(200, {"ok": True, "message": "Senha redefinida. A pessoa precisará entrar novamente."})
+
         if not path.startswith("/api/"):
             return self.json_response(404, {"error": "Endereço não encontrado."})
         kind = path.removeprefix("/api/")
@@ -204,10 +239,44 @@ class Handler(SimpleHTTPRequestHandler):
             "admin": KINDS,
             "supervisor": KINDS,
             "technician": {"orders", "maintenance", "stockRequests", "purchaseRequests"},
-            "warehouse": {"stockRequests", "purchaseRequests"},
+            "warehouse": {"stockRequests", "purchaseRequests", "inventoryItems"},
         }
         if kind not in writable.get(role, set()):
             return self.json_response(403, {"error": "Seu perfil não tem permissão para alterar esse cadastro."})
+        if kind == "inventoryItems" and role not in {"admin", "warehouse"}:
+            return self.json_response(403, {"error": "Somente administradores e almoxarifado podem cadastrar ou ajustar o estoque."})
+        if kind == "inventoryItems":
+            try:
+                saved = self.save_inventory_item(data)
+                return self.json_response(200, saved)
+            except (ValueError, TypeError, OverflowError) as error:
+                return self.json_response(400, {"error": str(error)})
+            except sqlite3.Error:
+                return self.json_response(500, {"error": "Não foi possível atualizar o saldo do estoque."})
+        if kind == "stockRequests" and not data.get("id"):
+            try:
+                if not data.get("items"):
+                    return self.json_response(400, {"error": "Escolha os materiais cadastrados no almoxarifado antes de enviar."})
+                saved = self.create_stock_request(data, user)
+                return self.json_response(201, saved)
+            except (ValueError, TypeError, OverflowError) as error:
+                return self.json_response(400, {"error": str(error)})
+            except sqlite3.Error:
+                return self.json_response(500, {"error": "Não foi possível reservar os materiais solicitados."})
+        if kind == "stockRequests" and data.get("id"):
+            if role not in {"admin", "supervisor", "warehouse"}:
+                return self.json_response(403, {"error": "Somente a supervisão, administração ou almoxarifado podem atualizar pedidos."})
+            try:
+                saved = self.update_stock_request(str(data["id"]), str(data.get("status", "")), user)
+                return self.json_response(200, saved)
+            except PermissionError as error:
+                return self.json_response(403, {"error": str(error)})
+            except LookupError as error:
+                return self.json_response(404, {"error": str(error)})
+            except (ValueError, TypeError, OverflowError) as error:
+                return self.json_response(400, {"error": str(error)})
+            except sqlite3.Error:
+                return self.json_response(500, {"error": "Não foi possível atualizar o pedido de material."})
         try:
             if kind == "orders" and role == "technician":
                 if not data.get("id"):
@@ -341,6 +410,110 @@ class Handler(SimpleHTTPRequestHandler):
         return self.json_response(200, {"user": {"id": user_id, "username": username, "name": name, "role": role}}, (("Set-Cookie", cookie),))
 
     @staticmethod
+    def reserved_quantity(db, inventory_id):
+        reserved = 0.0
+        rows = db.execute("SELECT data FROM records WHERE kind='stockRequests'").fetchall()
+        for row in rows:
+            request = json.loads(row[0])
+            if request.get("status") in {"pending", "approved", "separated"}:
+                reserved += sum(float(item.get("quantity", 0)) for item in request.get("items", [])
+                                if item.get("item_id") == inventory_id)
+        return reserved
+
+    def save_inventory_item(self, item):
+        self.validate_record("inventoryItems", item)
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = dict(item)
+            saved["id"] = str(saved.get("id") or uuid4())
+            reserved = self.reserved_quantity(db, saved["id"])
+            if float(saved.get("quantity", 0)) < reserved:
+                raise ValueError(f"Há {reserved:g} unidade(s) reservada(s) em solicitações ainda não entregues.")
+            saved.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+            db.execute("INSERT OR REPLACE INTO records VALUES (?,?,?)",
+                       ("inventoryItems", saved["id"], json.dumps(saved, ensure_ascii=False, allow_nan=False)))
+            return saved
+
+    def create_stock_request(self, request, user):
+        raw_items = request.get("items")
+        if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 20:
+            raise ValueError("Selecione de 1 a 20 materiais cadastrados no almoxarifado.")
+        quantities = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                raise ValueError("Seleção de material inválida.")
+            item_id = str(item.get("item_id", ""))
+            quantity = float(item.get("quantity", 0))
+            if not item_id or not 0 < quantity <= 1_000_000:
+                raise ValueError("Informe materiais cadastrados e uma quantidade válida.")
+            quantities[item_id] = quantities.get(item_id, 0) + quantity
+
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            selected = []
+            for item_id, quantity in quantities.items():
+                row = db.execute("SELECT data FROM records WHERE kind='inventoryItems' AND id=?", (item_id,)).fetchone()
+                if not row:
+                    raise ValueError("Um dos materiais selecionados não existe mais no almoxarifado.")
+                inventory = json.loads(row[0])
+                reserved = self.reserved_quantity(db, item_id)
+                available = float(inventory.get("quantity", 0)) - reserved
+                if quantity > available:
+                    raise ValueError(f"Estoque disponível insuficiente para {inventory['name']}: restam {max(0, available):g} {inventory.get('unit', 'un')}.")
+                selected.append({"item_id": item_id, "name": inventory["name"],
+                                 "unit": inventory.get("unit", "un"), "quantity": quantity})
+            total = sum(item["quantity"] for item in selected)
+            data = {
+                "id": str(uuid4()), "items": selected,
+                "item": f"Solicitação com {len(selected)} {('item' if len(selected) == 1 else 'itens')}",
+                "quantity": total, "priority": str(request.get("priority", "Normal")),
+                "needed_for": str(request.get("needed_for", ""))[:180],
+                "notes": str(request.get("notes", ""))[:3000], "status": "pending",
+                "requester_id": user["id"], "requester": user["name"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.validate_record("stockRequests", data)
+            db.execute("INSERT INTO records VALUES (?,?,?)",
+                       ("stockRequests", data["id"], json.dumps(data, ensure_ascii=False, allow_nan=False)))
+            return data
+
+    def update_stock_request(self, request_id, status, user):
+        valid = {"approved", "separated", "delivered", "rejected"}
+        if status not in valid:
+            raise ValueError("Situação do pedido inválida.")
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM records WHERE kind='stockRequests' AND id=?", (request_id,)).fetchone()
+            if not row:
+                raise LookupError("Solicitação não encontrada.")
+            saved = json.loads(row[0])
+            if saved.get("items"):
+                transitions = {"pending": {"approved", "rejected"},
+                               "approved": {"separated", "rejected"},
+                               "separated": {"delivered", "rejected"}}
+                if status not in transitions.get(saved.get("status"), set()):
+                    raise PermissionError("Siga o fluxo: aprovar, separar e depois entregar; também é possível recusar antes da entrega.")
+                if status == "delivered":
+                    for item in saved["items"]:
+                        item_row = db.execute("SELECT data FROM records WHERE kind='inventoryItems' AND id=?", (item["item_id"],)).fetchone()
+                        if not item_row:
+                            raise ValueError(f"O material {item['name']} não existe mais no estoque.")
+                        inventory = json.loads(item_row[0])
+                        quantity = float(inventory.get("quantity", 0)) - float(item["quantity"])
+                        if quantity < -1e-9:
+                            raise ValueError(f"Estoque físico insuficiente para entregar {item['name']}.")
+                        inventory["quantity"] = max(0, quantity)
+                        db.execute("UPDATE records SET data=? WHERE kind='inventoryItems' AND id=?",
+                                   (json.dumps(inventory, ensure_ascii=False), inventory["id"]))
+            elif user["role"] == "warehouse" and status not in {"approved", "separated", "delivered", "rejected"}:
+                raise PermissionError("O almoxarifado não pode atualizar essa situação.")
+            saved["status"] = status
+            saved["handled_by"] = user["name"]
+            db.execute("UPDATE records SET data=? WHERE kind='stockRequests' AND id=?",
+                       (json.dumps(saved, ensure_ascii=False), request_id))
+            return saved
+
+    @staticmethod
     def validate_record(kind, data):
         if kind == "clients" and not str(data.get("name", "")).strip():
             raise ValueError("Informe o nome do cliente.")
@@ -367,6 +540,29 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("Informe o material e uma quantidade válida.")
             if data.get("status", "pending") not in {"pending", "approved", "separated", "delivered", "rejected"}:
                 raise ValueError("Status do pedido inválido.")
+            items = data.get("items")
+            if not data.get("id") and not items:
+                raise ValueError("Selecione materiais cadastrados no almoxarifado.")
+            if items is not None:
+                if not isinstance(items, list) or not items or len(items) > 20:
+                    raise ValueError("O pedido deve conter de 1 a 20 materiais.")
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("item_id") or not str(item.get("name", "")).strip():
+                        raise ValueError("Um dos materiais do pedido é inválido.")
+                    amount = float(item.get("quantity", 0))
+                    if not math.isfinite(amount) or not 0 < amount <= 1_000_000:
+                        raise ValueError("A quantidade de um dos materiais é inválida.")
+        if kind == "inventoryItems":
+            if not str(data.get("name", "")).strip() or len(str(data.get("name", ""))) > 180:
+                raise ValueError("Informe o nome do material.")
+            quantity = float(data.get("quantity", 0))
+            minimum = float(data.get("minimum_quantity", 0) or 0)
+            if not math.isfinite(quantity) or quantity < 0 or quantity > 1_000_000_000:
+                raise ValueError("Informe uma quantidade física válida.")
+            if not math.isfinite(minimum) or minimum < 0 or minimum > 1_000_000_000:
+                raise ValueError("Informe uma quantidade mínima válida.")
+            if not str(data.get("unit", "")).strip() or len(str(data.get("unit", ""))) > 24:
+                raise ValueError("Informe a unidade do material, como un, m ou caixa.")
         if kind == "purchaseRequests":
             if not str(data.get("item", "")).strip() or len(str(data.get("item", ""))) > 180:
                 raise ValueError("Informe o material ou ferramenta que deseja comprar.")
