@@ -21,7 +21,7 @@ git clone https://github.com/NetoSilva33/APLICATIVO-CFTV.git
 cd APLICATIVO-CFTV
 ```
 
-No Windows, abra `atualizar-e-iniciar.bat` para buscar a versão mais recente da branch `main` e iniciar o app. O Git for Windows precisa estar instalado. Se preferir atualizar manualmente, pare o servidor com **Ctrl+C**, execute `git pull --ff-only origin main` nesta pasta e inicie o app de novo. As alterações chegam ao computador na próxima atualização; o app não troca de versão enquanto está aberto.
+No Windows, abra `atualizar-e-iniciar.bat` para buscar a versão mais recente da branch `main` e iniciar o app. O Git for Windows precisa estar instalado. Os atalhos iniciam um supervisor que mantém o servidor na mesma janela e reinicia o processo Python quando `server.py` muda. Para buscar uma nova versão enquanto o app está rodando, abra uma segunda janela na pasta do projeto e execute `atualizar-sem-reiniciar.bat`; depois atualize o navegador com **Ctrl+F5**. Mudanças só na interface são servidas sem reiniciar o Python. Na primeira adoção deste supervisor, pare o servidor antigo com **Ctrl+C** e inicie-o uma vez pelo novo atalho. Não execute `atualizar-e-iniciar.bat` enquanto outra instância já estiver usando a porta 8000.
 
 Se você já cadastrou dados usando uma pasta baixada em ZIP, pare o servidor e copie `data/gestao.db` da pasta antiga para a pasta clonada. Esse banco fica somente no computador e não é enviado ao GitHub.
 

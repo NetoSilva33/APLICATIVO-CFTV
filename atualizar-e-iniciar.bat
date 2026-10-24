@@ -14,5 +14,5 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Iniciando Segura Gestao em http://127.0.0.1:8000
-py -3 server.py
+py -3 watch_server.py
 pause
