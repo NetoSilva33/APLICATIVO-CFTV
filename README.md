@@ -12,6 +12,19 @@ python3 server.py
 
 Abra http://127.0.0.1:8000. No Windows, execute `py -3 server.py` ou abra `iniciar.bat`. Na primeira abertura, crie o acesso de administrador com uma senha de pelo menos 12 caracteres. O administrador cadastra os outros acessos na área **Acessos**.
 
+### Manter a cópia local atualizada
+
+Clone o repositório uma vez, em vez de baixar um ZIP:
+
+```powershell
+git clone https://github.com/NetoSilva33/APLICATIVO-CFTV.git
+cd APLICATIVO-CFTV
+```
+
+No Windows, abra `atualizar-e-iniciar.bat` para buscar a versão mais recente da branch `main` e iniciar o app. O Git for Windows precisa estar instalado. Se preferir atualizar manualmente, pare o servidor com **Ctrl+C**, execute `git pull --ff-only origin main` nesta pasta e inicie o app de novo. As alterações chegam ao computador na próxima atualização; o app não troca de versão enquanto está aberto.
+
+Se você já cadastrou dados usando uma pasta baixada em ZIP, pare o servidor e copie `data/gestao.db` da pasta antiga para a pasta clonada. Esse banco fica somente no computador e não é enviado ao GitHub.
+
 O servidor escuta somente em `127.0.0.1` por padrão. Assim, esta execução serve ao próprio computador. Para acessar de outros aparelhos, hospede a aplicação atrás de HTTPS e configure o proxy antes de disponibilizar o endereço à equipe. Crie o administrador antes de expor uma instalação nova. Não exponha o servidor diretamente à internet.
 
 ## Áreas incluídas
